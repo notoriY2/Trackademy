@@ -135,24 +135,6 @@ const Login: React.FC = () => {
               {isLoading ? 'Signing in...' : 'Sign in'}
             </button>
           </form>
-
-          <div className="mt-8 border-t border-gray-200 pt-6">
-            <h3 className="text-sm font-medium text-gray-700 mb-4">Demo Credentials:</h3>
-            <div className="space-y-2 text-xs text-gray-600">
-              <div className="flex justify-between">
-                <span>Student:</span>
-                <span>STU001 / student123</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Lecturer:</span>
-                <span>LEC001 / lecturer123</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Admin:</span>
-                <span>ADM001 / admin123</span>
-              </div>
-            </div>
-          </div>
         </div>
 
         <div className="text-center">
