@@ -140,11 +140,11 @@ const Login: React.FC = () => {
             <div className="space-y-2 text-xs text-gray-600">
               <div className="flex justify-between">
                 <span>Student:</span>
-                <span>STU001 / student123</span>
+                <span>202502664 / 202502664@spu123</span>
               </div>
               <div className="flex justify-between">
                 <span>Lecturer:</span>
-                <span>LEC001 / lecturer123</span>
+                <span>202702664 / 202702664@spu123</span>
               </div>
               <div className="flex justify-between">
                 <span>Admin:</span>
