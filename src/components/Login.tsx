@@ -144,7 +144,7 @@ const Login: React.FC = () => {
               </div>
               <div className="flex justify-between">
                 <span>Lecturer:</span>
-                <span>202702664 / 202702664@spu123</span>
+                <span>202302664 / 202302664@spu123</span>
               </div>
               <div className="flex justify-between">
                 <span>Admin:</span>
