@@ -38,27 +38,35 @@ export interface CoursePerformance {
 }
 
 /**
- * Calculate student GPA from their completed course enrollments
+ * Calculate student GPA from completed course enrollments.
+ * Includes completed and failed enrollments with recorded grade points.
  */
-export async function calculateStudentGpa(studentId: string): Promise<number> {
+export async function calculateStudentGpa(
+  studentId: string
+): Promise<number> {
   const { data, error } = await supabase
-    .from('student_enrollments')
+    .from('enrollments')
     .select('grade_points')
     .eq('student_id', studentId)
-    .eq('status', 'completed')
+    .in('status', ['completed', 'failed'])
     .not('grade_points', 'is', null);
 
   if (error || !data || data.length === 0) {
     return 0;
   }
 
-  const sum = data.reduce((acc, row) => acc + (row.grade_points || 0), 0);
+  const sum = data.reduce(
+    (acc, row) => acc + (row.grade_points || 0),
+    0
+  );
+
   const avg = sum / data.length;
+
   return Math.round(avg * 100) / 100;
 }
 
 /**
- * Get system-wide performance metrics
+ * Get system-wide performance metrics.
  */
 export async function getPerformanceMetrics(): Promise<PerformanceMetrics> {
   try {
@@ -70,31 +78,46 @@ export async function getPerformanceMetrics(): Promise<PerformanceMetrics> {
 
     // Total enrollments
     const { count: totalEnrollments } = await supabase
-      .from('student_enrollments')
+      .from('enrollments')
       .select('*', { count: 'exact', head: true })
       .in('status', ['enrolled', 'completed']);
 
-    // Average GPA calculation
+    // Average GPA, including completed and failed courses
     const { data: gpaData } = await supabase
-      .from('student_enrollments')
+      .from('enrollments')
       .select('grade_points')
-      .eq('status', 'completed')
+      .in('status', ['completed', 'failed'])
       .not('grade_points', 'is', null);
 
-    const averageGpa = gpaData && gpaData.length > 0
-      ? Math.round((gpaData.reduce((acc, row) => acc + (row.grade_points || 0), 0) / gpaData.length) * 100) / 100
-      : 0;
+    const averageGpa =
+      gpaData && gpaData.length > 0
+        ? Math.round(
+            (gpaData.reduce(
+              (acc, row) => acc + (row.grade_points || 0),
+              0
+            ) /
+              gpaData.length) *
+              100
+          ) / 100
+        : 0;
 
     // Overall pass rate
     const { data: gradeData } = await supabase
-      .from('student_enrollments')
+      .from('enrollments')
       .select('final_percentage')
       .not('final_percentage', 'is', null);
 
-    const passedCount = gradeData?.filter(row => (row.final_percentage || 0) >= 50).length || 0;
-    const overallPassRate = gradeData && gradeData.length > 0
-      ? Math.round((passedCount / gradeData.length) * 10000) / 100
-      : 0;
+    const passedCount =
+      gradeData?.filter(
+        row => (row.final_percentage || 0) >= 50
+      ).length || 0;
+
+    const overallPassRate =
+      gradeData && gradeData.length > 0
+        ? Math.round(
+            (passedCount / gradeData.length) * 10000
+          ) / 100
+        : 0;
 
     // Dropout rate
     const { count: allStudentsCount } = await supabase
@@ -106,19 +129,25 @@ export async function getPerformanceMetrics(): Promise<PerformanceMetrics> {
       .select('*', { count: 'exact', head: true })
       .in('status', ['withdrawn', 'suspended']);
 
-    const dropoutRate = allStudentsCount && allStudentsCount > 0
-      ? Math.round(((droppedCount || 0) / allStudentsCount) * 10000) / 100
-      : 0;
+    const dropoutRate =
+      allStudentsCount && allStudentsCount > 0
+        ? Math.round(
+            ((droppedCount || 0) / allStudentsCount) * 10000
+          ) / 100
+        : 0;
 
-    // Exam eligible
+    // Exam eligibility
     const { count: examEligibleCount } = await supabase
-      .from('student_enrollments')
+      .from('enrollments')
       .select('*', { count: 'exact', head: true })
       .eq('is_exam_eligible', true);
 
-    const examEligibleRate = totalEnrollments && totalEnrollments > 0
-      ? Math.round(((examEligibleCount || 0) / totalEnrollments) * 10000) / 100
-      : 0;
+    const examEligibleRate =
+      totalEnrollments && totalEnrollments > 0
+        ? Math.round(
+            ((examEligibleCount || 0) / totalEnrollments) * 10000
+          ) / 100
+        : 0;
 
     return {
       totalStudents: totalStudents || 0,
@@ -127,10 +156,11 @@ export async function getPerformanceMetrics(): Promise<PerformanceMetrics> {
       overallPassRate,
       dropoutRate,
       examEligibleCount: examEligibleCount || 0,
-      examEligibleRate
+      examEligibleRate,
     };
   } catch (error) {
     console.error('Error fetching performance metrics:', error);
+
     return {
       totalStudents: 0,
       totalEnrollments: 0,
@@ -138,15 +168,17 @@ export async function getPerformanceMetrics(): Promise<PerformanceMetrics> {
       overallPassRate: 0,
       dropoutRate: 0,
       examEligibleCount: 0,
-      examEligibleRate: 0
+      examEligibleRate: 0,
     };
   }
 }
 
 /**
- * Get department performance metrics
+ * Get department performance metrics.
  */
-export async function getDepartmentPerformance(): Promise<DepartmentPerformance[]> {
+export async function getDepartmentPerformance(): Promise<
+  DepartmentPerformance[]
+> {
   try {
     const { data: departments, error } = await supabase
       .from('departments')
@@ -160,6 +192,7 @@ export async function getDepartmentPerformance(): Promise<DepartmentPerformance[
       .eq('status', 'active');
 
     if (error || !departments) {
+      console.error('Error fetching departments:', error);
       return [];
     }
 
@@ -167,10 +200,18 @@ export async function getDepartmentPerformance(): Promise<DepartmentPerformance[
 
     for (const dept of departments) {
       // Get programs in this department
-      const { data: programs } = await supabase
+      const { data: programs, error: programsError } = await supabase
         .from('programs')
         .select('id')
         .eq('department_id', dept.id);
+
+      if (programsError) {
+        console.error(
+          `Error fetching programs for department ${dept.id}:`,
+          programsError
+        );
+        continue;
+      }
 
       if (!programs || programs.length === 0) {
         continue;
@@ -178,7 +219,7 @@ export async function getDepartmentPerformance(): Promise<DepartmentPerformance[
 
       const programIds = programs.map(p => p.id);
 
-      // Get students in these programs
+      // Get active students in these programs
       const { data: students, count: studentCount } = await supabase
         .from('students')
         .select('id', { count: 'exact' })
@@ -193,8 +234,9 @@ export async function getDepartmentPerformance(): Promise<DepartmentPerformance[
           totalStudents: 0,
           averageGpa: 0,
           passRate: 0,
-          enrollmentCount: 0
+          enrollmentCount: 0,
         });
+
         continue;
       }
 
@@ -202,22 +244,39 @@ export async function getDepartmentPerformance(): Promise<DepartmentPerformance[
 
       // Get enrollments for these students
       const { data: enrollments, count: enrollmentCount } = await supabase
-        .from('student_enrollments')
+        .from('enrollments')
         .select('grade_points, final_percentage', { count: 'exact' })
         .in('student_id', studentIds);
 
       // Calculate average GPA
-      const gpaValues = enrollments?.filter(e => e.grade_points != null).map(e => e.grade_points) || [];
-      const averageGpa = gpaValues.length > 0
-        ? Math.round((gpaValues.reduce((acc, val) => acc + val, 0) / gpaValues.length) * 100) / 100
-        : 0;
+      const gpaValues =
+        enrollments
+          ?.filter(e => e.grade_points != null)
+          .map(e => e.grade_points) || [];
+
+      const averageGpa =
+        gpaValues.length > 0
+          ? Math.round(
+              (gpaValues.reduce((acc, val) => acc + val, 0) /
+                gpaValues.length) *
+                100
+            ) / 100
+          : 0;
 
       // Calculate pass rate
-      const gradedEnrollments = enrollments?.filter(e => e.final_percentage != null) || [];
-      const passedCount = gradedEnrollments.filter(e => e.final_percentage >= 50).length;
-      const passRate = gradedEnrollments.length > 0
-        ? Math.round((passedCount / gradedEnrollments.length) * 10000) / 100
-        : 0;
+      const gradedEnrollments =
+        enrollments?.filter(e => e.final_percentage != null) || [];
+
+      const passedCount = gradedEnrollments.filter(
+        e => e.final_percentage! >= 50
+      ).length;
+
+      const passRate =
+        gradedEnrollments.length > 0
+          ? Math.round(
+              (passedCount / gradedEnrollments.length) * 10000
+            ) / 100
+          : 0;
 
       results.push({
         departmentId: dept.id,
@@ -226,11 +285,13 @@ export async function getDepartmentPerformance(): Promise<DepartmentPerformance[
         totalStudents: studentCount || 0,
         averageGpa,
         passRate,
-        enrollmentCount: enrollmentCount || 0
+        enrollmentCount: enrollmentCount || 0,
       });
     }
 
-    return results.sort((a, b) => a.departmentName.localeCompare(b.departmentName));
+    return results.sort((a, b) =>
+      a.departmentName.localeCompare(b.departmentName)
+    );
   } catch (error) {
     console.error('Error fetching department performance:', error);
     return [];
@@ -238,7 +299,7 @@ export async function getDepartmentPerformance(): Promise<DepartmentPerformance[
 }
 
 /**
- * Get course performance metrics
+ * Get course performance metrics.
  */
 export async function getCoursePerformance(): Promise<CoursePerformance[]> {
   try {
@@ -249,7 +310,6 @@ export async function getCoursePerformance(): Promise<CoursePerformance[]> {
         code,
         name,
         semester,
-        academic_year,
         programs:program_id (
           name,
           departments:department_id (
@@ -264,31 +324,63 @@ export async function getCoursePerformance(): Promise<CoursePerformance[]> {
       .limit(100);
 
     if (error || !courses) {
+      console.error('Error fetching courses:', error);
       return [];
     }
 
     const results: CoursePerformance[] = [];
 
     for (const course of courses) {
-      const { data: enrollments, count: enrolledCount } = await supabase
-        .from('student_enrollments')
+      const {
+        data: enrollments,
+        count: enrolledCount,
+      } = await supabase
+        .from('enrollments')
         .select('final_percentage, grade_points', { count: 'exact' })
         .eq('course_id', course.id);
 
-      const gradedEnrollments = enrollments?.filter(e => e.final_percentage != null) || [];
-      const passedCount = gradedEnrollments.filter(e => e.final_percentage >= 50).length;
-      const passRate = gradedEnrollments.length > 0
-        ? Math.round((passedCount / gradedEnrollments.length) * 10000) / 100
-        : 0;
+      // Calculate pass rate
+      const gradedEnrollments =
+        enrollments?.filter(e => e.final_percentage != null) || [];
 
-      const avgPercentage = gradedEnrollments.length > 0
-        ? Math.round((gradedEnrollments.reduce((acc, e) => acc + e.final_percentage, 0) / gradedEnrollments.length) * 100) / 100
-        : 0;
+      const passedCount = gradedEnrollments.filter(
+        e => e.final_percentage! >= 50
+      ).length;
 
-      const gpaValues = enrollments?.filter(e => e.grade_points != null).map(e => e.grade_points) || [];
-      const avgGpa = gpaValues.length > 0
-        ? Math.round((gpaValues.reduce((acc, val) => acc + val, 0) / gpaValues.length) * 100) / 100
-        : 0;
+      const passRate =
+        gradedEnrollments.length > 0
+          ? Math.round(
+              (passedCount / gradedEnrollments.length) * 10000
+            ) / 100
+          : 0;
+
+      // Calculate average percentage
+      const avgPercentage =
+        gradedEnrollments.length > 0
+          ? Math.round(
+              (gradedEnrollments.reduce(
+                (acc, e) => acc + e.final_percentage!,
+                0
+              ) /
+                gradedEnrollments.length) *
+                100
+            ) / 100
+          : 0;
+
+      // Calculate average GPA
+      const gpaValues =
+        enrollments
+          ?.filter(e => e.grade_points != null)
+          .map(e => e.grade_points) || [];
+
+      const avgGpa =
+        gpaValues.length > 0
+          ? Math.round(
+              (gpaValues.reduce((acc, val) => acc + val, 0) /
+                gpaValues.length) *
+                100
+            ) / 100
+          : 0;
 
       const program = course.programs as any;
       const department = program?.departments as any;
@@ -299,7 +391,7 @@ export async function getCoursePerformance(): Promise<CoursePerformance[]> {
         code: course.code,
         name: course.name,
         semester: course.semester,
-        academicYear: course.academic_year,
+        academicYear: '',
         programName: program?.name || 'Unknown',
         departmentName: department?.name || 'Unknown',
         facultyName: faculty?.name || 'Unknown',
@@ -308,7 +400,7 @@ export async function getCoursePerformance(): Promise<CoursePerformance[]> {
         passedStudents: passedCount,
         passRate,
         averagePercentage: avgPercentage,
-        averageGpa: avgGpa
+        averageGpa: avgGpa,
       });
     }
 

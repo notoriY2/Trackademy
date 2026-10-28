@@ -28,7 +28,6 @@ type AcademicRow = {
   id: string;
   passing_grade_percent: string | number | null;
   max_credits_per_semester: number | null;
-  attendance_requirement_percent: string | number | null;
   exam_eligibility_threshold_percent: string | number | null;
   grading_scale: string | null;
   allow_late_enrollment: boolean | null;
@@ -66,7 +65,6 @@ const Settings: React.FC = () => {
     academic: {
       passingGrade: '',
       maxCreditsPerSemester: '',
-      attendanceRequirement: '',
       examEligibilityThreshold: '',
       gradingScale: '',
       allowLateEnrollment: false
@@ -150,7 +148,6 @@ const Settings: React.FC = () => {
             academic: {
               passingGrade: r.passing_grade_percent != null ? String(r.passing_grade_percent) : '',
               maxCreditsPerSemester: r.max_credits_per_semester != null ? String(r.max_credits_per_semester) : '',
-              attendanceRequirement: r.attendance_requirement_percent != null ? String(r.attendance_requirement_percent) : '',
               examEligibilityThreshold: r.exam_eligibility_threshold_percent != null ? String(r.exam_eligibility_threshold_percent) : '',
               gradingScale: r.grading_scale ?? '',
               allowLateEnrollment: !!r.allow_late_enrollment
@@ -237,7 +234,6 @@ const Settings: React.FC = () => {
       const acadPayload = {
         passing_grade_percent: settings.academic.passingGrade === '' ? null : Number(settings.academic.passingGrade),
         max_credits_per_semester: settings.academic.maxCreditsPerSemester === '' ? null : Number(settings.academic.maxCreditsPerSemester),
-        attendance_requirement_percent: settings.academic.attendanceRequirement === '' ? null : Number(settings.academic.attendanceRequirement),
         exam_eligibility_threshold_percent: settings.academic.examEligibilityThreshold === '' ? null : Number(settings.academic.examEligibilityThreshold),
         grading_scale: settings.academic.gradingScale || null,
         allow_late_enrollment: !!settings.academic.allowLateEnrollment,
@@ -529,9 +525,8 @@ function SettingsTabs({
               className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
               <option value="">-- Select --</option>
+              <option value="Africa/Johannesburg">Africa/Johannesburg (SAST)</option>
               <option value="UTC">UTC</option>
-              <option value="UTC-5">UTC-5</option>
-              <option value="UTC+2">UTC+2</option>
             </select>
           </div>
           <div>
@@ -665,7 +660,7 @@ function SettingsTabs({
           ) : (
             <div className="space-y-2">
               {adminState.currentAdmins.map((admin: any) => {
-                const profile = Array.isArray(admin.profiles) && admin.profiles.length > 0 ? admin.profiles[0] : null;
+                const profile = Array.isArray(admin.profiles) ? (admin.profiles[0] ?? null) : (admin.profiles ?? null);
                 const name = profile ? `${profile.first_name || ''} ${profile.last_name || ''}`.trim() : 'No profile';
                 const userNumber = profile?.user_number ?? '—';
                 return (
