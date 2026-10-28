@@ -1,9 +1,12 @@
 // LecturerDashboard.tsx
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import UserProfileModal from './UserProfileModal';
 import { GraduationCap, BookOpen, Users, BarChart3, Upload, LogOut, User, FileText, CheckCircle, XCircle, Plus, CreditCard as Edit, Download, Bell, Send, TrendingUp, AlertTriangle, Target, Eye, Search as SearchIcon } from 'lucide-react';
+
+/** Storage bucket used for announcement attachments. Must exist (public read) in your Supabase project. */
+const ATTACHMENTS_BUCKET = 'course-materials';
 
 /** Types */
 interface User {
@@ -141,6 +144,24 @@ const LecturerDashboard: React.FC = () => {
   /** Lecturer data (stateful) */
   const [lecturerData, setLecturerData] = useState<{ courses: Course[] }>({ courses: [] });
 
+  /** Dirty/unsaved mark tracking so marks are only written to the DB on blur or "Save All",
+   *  instead of firing a save request on every keystroke. Key = `${courseId}:${studentId}:${assessmentId}` */
+  const [dirtyMarks, setDirtyMarks] = useState<Record<string, true>>({});
+  const [savingMarks, setSavingMarks] = useState<Record<string, boolean>>({});
+
+  /** Academic policy thresholds, loaded from Settings instead of being hardcoded in this component. */
+  const [examEligibilityThreshold, setExamEligibilityThreshold] = useState<number>(50);
+  const [passingGrade, setPassingGrade] = useState<number>(50);
+
+  /** Average course completion, derived from each course's completionProgress (itself sourced from
+   *  vw_course_completion_progress during the main fetch) instead of being fetched again separately. */
+  const avgCompletion = useMemo(() => {
+    if (!lecturerData.courses.length) return 0;
+    return Math.round(
+      lecturerData.courses.reduce((sum, c) => sum + (c.completionProgress || 0), 0) / lecturerData.courses.length
+    );
+  }, [lecturerData.courses]);
+
   /** Marks filter and search */
   const [marksFilterAssessmentId, setMarksFilterAssessmentId] = useState<string | 'all'>('all');
   const [marksSearch, setMarksSearch] = useState<string>('');
@@ -168,11 +189,6 @@ const LecturerDashboard: React.FC = () => {
   const [marksModalAssessmentId, setMarksModalAssessmentId] = useState<string | null>(null);
   const [marksModalValues, setMarksModalValues] = useState<Record<string, number | null>>({});
 
-  // --- NEW: course completion state ---
-const [avgCompletion, setAvgCompletion] = useState<number>(0);
-
-
-  /** Authentication effect */
   /** Authentication effect */
 useEffect(() => {
   const userData = localStorage.getItem('user');
@@ -182,7 +198,31 @@ useEffect(() => {
   setUser(parsedUser);
 }, [navigate]);
 
+/** Load academic policy thresholds (exam eligibility %, passing grade %) instead of hardcoding 50. */
+useEffect(() => {
+  const fetchPolicy = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('academic_policies')
+        .select('exam_eligibility_threshold_percent, passing_grade_percent')
+        .limit(1)
+        .maybeSingle();
 
+      if (error) throw error;
+
+      if (data?.exam_eligibility_threshold_percent != null) {
+        setExamEligibilityThreshold(Number(data.exam_eligibility_threshold_percent));
+      }
+      if (data?.passing_grade_percent != null) {
+        setPassingGrade(Number(data.passing_grade_percent));
+      }
+    } catch (err) {
+      console.error('Failed to load academic policy thresholds, falling back to 50%', err);
+    }
+  };
+
+  fetchPolicy();
+}, []);
 
 
 useEffect(() => {
@@ -263,6 +303,8 @@ useEffect(() => {
         studentNumber: se.student?.student_number ?? '',
         assessments: {},
         courseworkTotal: Number(se.final_grade ?? 0),
+        // Source of truth for eligibility is the DB (trigger-maintained); never recompute this
+        // locally against a hardcoded threshold.
         examEligible: !!se.is_exam_eligible,
       }));
 
@@ -314,16 +356,25 @@ useEffect(() => {
           });
           s.assessments = assessmentMap;
           s.courseworkTotal = computeCourseworkTotal(s, course);
-          s.examEligible = s.courseworkTotal >= 50;
+          // NOTE: examEligible is intentionally left untouched here — it already reflects the
+          // DB's is_exam_eligible flag (trigger-maintained against the real academic policy
+          // threshold), and must not be overwritten by a hardcoded ">= 50" comparison.
         });
 
-        // --- optional: local fallback progress ---
+        // --- local fallback progress (used only until the DB view below overrides it) ---
+        // An assessment only counts as "marked" once EVERY enrolled student has a recorded
+        // mark for it — not merely once a single student has one.
         const totalAssessments = course.assessments.length;
         let markedAssessments = 0;
-        if (totalAssessments > 0) {
-          markedAssessments = course.assessments.filter((a: any) =>
-            marks?.some((m: any) => m.assessment_id === a.id)
-          ).length;
+        if (totalAssessments > 0 && course.students.length > 0) {
+          markedAssessments = course.assessments.filter((a: any) => {
+            const studentIdsWithMark = new Set(
+              (marks || [])
+                .filter((m: any) => m.assessment_id === a.id)
+                .map((m: any) => m.student_id)
+            );
+            return course.students.every((s: any) => studentIdsWithMark.has(s.id));
+          }).length;
         }
 
         course.totalAssessments = totalAssessments;
@@ -335,7 +386,9 @@ useEffect(() => {
       });
     }
 
-    // 6) Fetch completion progress per course from SQL view (vw_course_completion_progress)
+    // 6) Fetch completion progress per course from SQL view (vw_course_completion_progress).
+    // This is the authoritative source for completion; it also feeds the dashboard's
+    // "Avg Completion" stat (derived via useMemo) so we don't fetch it a second time.
     const { data: progressData, error: progressErr } = await supabase
       .from('vw_course_completion_progress')
       .select(
@@ -404,173 +457,144 @@ useEffect(() => {
     }
   }, [lecturerData.courses, selectedCourse]);
 
-  useEffect(() => {
-  if (selectedCourse === null && lecturerData.courses.length > 0) {
-    setSelectedCourse(lecturerData.courses[0].id);
-    setNewAssessment(prev => ({ ...prev, courseId: lecturerData.courses[0].id }));
-    setAnnouncement(prev => ({ ...prev, courseId: lecturerData.courses[0].id }));
-  }
-}, [lecturerData.courses, selectedCourse]);
 
-// --- NEW: Fetch average completion from view ---
-useEffect(() => {
-  if (!user) return;
-
-  const fetchCompletion = async () => {
-    try {
-      // 1. Find lecturer ID
-      const { data: lecRow, error: lecErr } = await supabase
-        .from('lecturers')
-        .select('id')
-        .eq('lecturer_number', user.userNumber)
-        .maybeSingle();
-
-      if (lecErr || !lecRow) return;
-
-      // 2. Query view
-      const { data: completionData, error } = await supabase
-        .from('vw_course_completion_progress')
-        .select('course_id, completion_progress')
-        .eq('lecturer_id', lecRow.id);
-
-      if (error) throw error;
-
-      // 3. Compute average
-      const avg = Math.round(
-        (completionData?.reduce(
-          (sum, c) => sum + (c.completion_progress || 0),
-          0
-        ) || 0) / Math.max(1, completionData?.length || 1)
-      );
-
-      setAvgCompletion(avg);
-    } catch (err) {
-      console.error('fetchCompletion error', err);
-    }
-  };
-
-  fetchCompletion();
-}, [user]);
-
-
-  /** Update student mark helper */
-  const updateStudentMark = async (
-  courseId: string,
-  studentId: string,
-  assessmentId: string,
-  value: number | null
-) => {
-  try {
-    // find course + assessment (local state)
-    const course = lecturerData.courses.find(c => String(c.id) === courseId);
-    const assessment = course?.assessments.find(a => a.id === assessmentId);
-    if (!course || !assessment) throw new Error("Course or assessment not found");
-
-    // percentage for this assessment (0-100) or null
-    const percentage =
-      value === null || !assessment?.maxMarks
-        ? null
-        : (value / assessment.maxMarks) * 100;
-
-    // 1) persist the student_assessment_marks row
-    const { error: markError } = await supabase
-      .from("student_assessment_marks")
-      .upsert(
-        {
-          student_id: studentId,
-          assessment_id: assessmentId,
-          marks_obtained: value,
-          percentage,
-          created_by: user?.userId,
-          updated_by: user?.userId,
-        },
-        { onConflict: "student_id,assessment_id" }
-      );
-    if (markError) throw markError;
-
-    // 2) update local UI immediately (optimistic)
+  /** Update a mark locally only (optimistic UI) — does NOT hit the database. Used on every
+   *  keystroke in the marks grid so typing feels instant without firing a save per character. */
+  const setLocalMark = (
+    courseId: string,
+    studentId: string,
+    assessmentId: string,
+    value: number | null
+  ) => {
     setLecturerData(prev => {
       const courses = prev.courses.map(c => {
         if (String(c.id) !== courseId) return c;
         const students = c.students.map(s => {
           if (s.id !== studentId) return s;
           const newAssess = { ...s.assessments, [assessmentId]: value };
-          const updatedStudent = {
+          return {
             ...s,
             assessments: newAssess,
             courseworkTotal: computeCourseworkTotal({ ...s, assessments: newAssess }, c),
           };
-          updatedStudent.examEligible = updatedStudent.courseworkTotal >= 50;
-          return updatedStudent;
         });
         return { ...c, students };
       });
       return { ...prev, courses };
     });
 
-    // 3) IMPORTANT: compute coursework total using a temp student (don't rely on async state)
-    const courseState = lecturerData.courses.find(c => String(c.id) === courseId);
-    const studentState = courseState?.students.find(s => s.id === studentId);
+    setDirtyMarks(prev => ({ ...prev, [`${courseId}:${studentId}:${assessmentId}`]: true }));
+  };
 
-    const newAssessMap = { ...(studentState?.assessments ?? {}), [assessmentId]: value };
+  /** Persist one mark to the database (called on blur, or from "Save All Marks" / the marks
+   *  modal). The DB trigger recomputes eligibility, final grade and GPA — and now rejects a
+   *  mark above the assessment's maximum — so we simply write the mark and read the result back. */
+  const commitMarkToServer = async (
+    courseId: string,
+    studentId: string,
+    assessmentId: string,
+    value: number | null
+  ) => {
+    const key = `${courseId}:${studentId}:${assessmentId}`;
 
-    const tempStudent: Student = {
-      id: studentId,
-      firstName: studentState?.firstName ?? '',
-      lastName: studentState?.lastName ?? '',
-      name: studentState?.name ?? '',
-      studentNumber: studentState?.studentNumber ?? '',
-      assessments: newAssessMap,
-      courseworkTotal: 0,
-      examEligible: false,
-    };
-
-    const courseworkTotal = computeCourseworkTotal(tempStudent, course);
-    const isEligible = courseworkTotal >= 50;
-
-    // 4) persist is_exam_eligible to enrollments
-    const { error: enrollError } = await supabase
-      .from("enrollments")
-      .update({ is_exam_eligible: isEligible })
-      .eq("student_id", studentId)
-      .eq("course_id", courseId);
-    if (enrollError) throw enrollError;
-
-    // 5) If this assessment is an exam -> compute final percentage and grade, persist them
-    if (String(assessment.type ?? '').toLowerCase().includes('exam')) {
-      const examPct = percentage ?? 0; // 0-100
-      const finalPercentage = courseworkTotal * 0.5 + examPct * 0.5; // 50/50 weighting
-
-      let finalGrade = "F";
-      let gradePoints = 0.0;
-      if (finalPercentage >= 75) { finalGrade = "A"; gradePoints = 4.0; }
-      else if (finalPercentage >= 60) { finalGrade = "B"; gradePoints = 3.0; }
-      else if (finalPercentage >= 50) { finalGrade = "C"; gradePoints = 2.0; }
-      else if (finalPercentage >= 40) { finalGrade = "D"; gradePoints = 1.0; }
-
-      const { error: finalError } = await supabase
-        .from("enrollments")
-        .update({
-          final_percentage: Number(finalPercentage.toFixed(2)),
-          final_grade: finalGrade,
-          grade_points: gradePoints,
-        })
-        .eq("student_id", studentId)
-        .eq("course_id", courseId);
-
-      if (finalError) throw finalError;
-
-      pushToast(`Final grade saved: ${finalGrade} (${finalPercentage.toFixed(2)}%)`, 'success');
-    } else {
-      pushToast('Mark saved successfully', 'success');
+    const course = lecturerData.courses.find(c => String(c.id) === courseId);
+    const assessment = course?.assessments.find(a => a.id === assessmentId);
+    if (!course || !assessment) {
+      pushToast('Could not find course or assessment', 'error');
+      return;
     }
-  } catch (err) {
-    console.error('Error saving mark:', err);
-    pushToast('Failed to save mark', 'error');
-  }
-};
 
+    // Client-side clamping is just a UX nicety; the database is the real authority and will
+    // reject a mark above the assessment's maximum.
+    const clamped = value === null ? null : Math.max(0, Math.min(assessment.maxMarks, Math.round(value)));
 
+    setSavingMarks(prev => ({ ...prev, [key]: true }));
+    try {
+      const percentage =
+        clamped === null || !assessment.maxMarks ? null : (clamped / assessment.maxMarks) * 100;
+
+      // 1) persist the student_assessment_marks row
+      const { error: markError } = await supabase
+        .from('student_assessment_marks')
+        .upsert(
+          {
+            student_id: studentId,
+            assessment_id: assessmentId,
+            marks_obtained: clamped,
+            percentage,
+            created_by: user?.userId,
+            updated_by: user?.userId,
+          },
+          { onConflict: 'student_id,assessment_id' }
+        );
+      if (markError) throw markError;
+
+      // DB triggers recompute eligibility, final grade and GPA, so just read the result back
+      const { data: enr } = await supabase
+        .from('enrollments')
+        .select('is_exam_eligible, final_percentage, final_grade')
+        .eq('student_id', studentId).eq('course_id', courseId)
+        .order('attempt_number', { ascending: false }).limit(1).maybeSingle();
+
+      // sync the authoritative eligibility flag back into local state
+      if (enr) {
+        setLecturerData(prev => {
+          const courses = prev.courses.map(c => {
+            if (String(c.id) !== courseId) return c;
+            const students = c.students.map(s =>
+              s.id === studentId ? { ...s, examEligible: !!enr.is_exam_eligible } : s
+            );
+            return { ...c, students };
+          });
+          return { ...prev, courses };
+        });
+      }
+
+      if (enr?.final_grade) pushToast(`Final grade saved: ${enr.final_grade} (${enr.final_percentage}%)`, 'success');
+      else pushToast('Mark saved successfully', 'success');
+
+      setDirtyMarks(prev => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    } catch (err: any) {
+      console.error('Error saving mark:', err);
+      pushToast(`Failed to save mark: ${err?.message ?? 'unknown error'}`, 'error');
+    } finally {
+      setSavingMarks(prev => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    }
+  };
+
+  /** Save every unsaved ("dirty") mark for a given course — this is what "Save All Marks"
+   *  now actually does, instead of just showing a toast. */
+  const handleSaveAllMarks = async (courseId: string) => {
+    const course = lecturerData.courses.find(c => String(c.id) === courseId);
+    if (!course) return;
+
+    const toSave: Array<{ studentId: string; assessmentId: string; value: number | null }> = [];
+    Object.keys(dirtyMarks).forEach(key => {
+      const [cId, studentId, assessmentId] = key.split(':');
+      if (cId !== courseId) return;
+      const student = course.students.find(s => s.id === studentId);
+      if (!student) return;
+      toSave.push({ studentId, assessmentId, value: student.assessments[assessmentId] ?? null });
+    });
+
+    if (toSave.length === 0) {
+      pushToast('No unsaved marks for this course', 'info');
+      return;
+    }
+
+    for (const item of toSave) {
+      // eslint-disable-next-line no-await-in-loop
+      await commitMarkToServer(courseId, item.studentId, item.assessmentId, item.value);
+    }
+  };
 
 
   /** Create assessment */
@@ -645,6 +669,61 @@ const handleCreateAssessment = async () => {
 };
 
 
+  /** Upload announcement attachments to Supabase Storage so they survive the session, instead
+   *  of only holding ephemeral blob: URLs that die when the tab closes. */
+  const handleAnnouncementFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const courseId = announcement.courseId || selectedCourse || 'general';
+
+    for (const file of Array.from(files)) {
+      const tempId = `${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+      try {
+        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const path = `announcements/${courseId}/${tempId}-${safeName}`;
+
+        const { error: uploadError } = await supabase.storage
+          .from(ATTACHMENTS_BUCKET)
+          .upload(path, file, { cacheControl: '3600', upsert: false });
+
+        if (uploadError) throw uploadError;
+
+        const { data: publicUrlData } = supabase.storage
+          .from(ATTACHMENTS_BUCKET)
+          .getPublicUrl(path);
+
+        const uploaded: ResourceFile = {
+          id: tempId,
+          name: file.name,
+          url: publicUrlData.publicUrl
+        };
+
+        setAnnouncementAttachments(prev => [...prev, uploaded]);
+      } catch (err: any) {
+        console.error('Failed to upload attachment', file.name, err);
+        pushToast(`Failed to upload ${file.name}: ${err?.message ?? 'unknown error'}`, 'error');
+      }
+    }
+  };
+
+  /** Remove an attachment locally and best-effort delete it from storage too. */
+  const removeAnnouncementAttachment = async (id: string) => {
+    const att = announcementAttachments.find(a => a.id === id);
+    setAnnouncementAttachments(prev => prev.filter(a => a.id !== id));
+
+    if (att?.url) {
+      try {
+        const marker = `/${ATTACHMENTS_BUCKET}/`;
+        const idx = att.url.indexOf(marker);
+        if (idx !== -1) {
+          const path = att.url.slice(idx + marker.length);
+          await supabase.storage.from(ATTACHMENTS_BUCKET).remove([path]);
+        }
+      } catch (err) {
+        console.warn('Failed to remove attachment from storage (non-fatal)', err);
+      }
+    }
+  };
+
   /** Send announcement */
 const handleSendAnnouncement = async () => {
   if (!announcement.title.trim() || !announcement.message.trim()) {
@@ -661,7 +740,10 @@ const handleSendAnnouncement = async () => {
         course_id: announcement.courseId,
         created_by: user?.userId,   // ✅ keep this
         published_at: new Date().toISOString(),
-        status: 'published'
+        status: 'published',
+        // Requires an `attachments jsonb` column on announcements; attachments are now real
+        // uploaded files (see handleAnnouncementFiles) rather than ephemeral blob: URLs.
+        attachments: announcementAttachments.length ? announcementAttachments : null
       }])
       .select()
       .single();
@@ -677,7 +759,7 @@ const handleSendAnnouncement = async () => {
         title: data.title,
         message: data.content,
         createdAt: data.published_at,
-        attachments: announcementAttachments
+        attachments: data.attachments ?? announcementAttachments
       }
     ]);
 
@@ -705,25 +787,24 @@ const handleSendAnnouncement = async () => {
     setShowMarksModal(true);
   };
 
-  /** Save marks from marks modal */
-  const handleSaveMarksModal = () => {
+  /** Save marks from marks modal — commits every row to the server (DB recomputes eligibility,
+   *  final grade and GPA, and rejects marks above the assessment maximum). */
+  const handleSaveMarksModal = async () => {
     if (!marksModalAssessmentId || !selectedCourse) { pushToast('Select an assessment', 'error'); return; }
     const assessmentId = marksModalAssessmentId;
     const courseId = selectedCourse;
-    Object.entries(marksModalValues).forEach(([studentIdStr, markVal]) => {
-      const studentId = studentIdStr; // ✅ keep UUID as-is
-      const course = lecturerData.courses.find(c => String(c.id) === courseId);
-      const assessment = course?.assessments.find(a => a.id === assessmentId);
-      if (!assessment) return;
-      const clamped = markVal === null ? null : Math.max(0, Math.min(assessment.maxMarks, Math.round(markVal)));
-      updateStudentMark(courseId, studentId, assessmentId, clamped);
-    });
-    setShowMarksModal(false);
-    pushToast('Marks saved', 'success');
-  };
+    const course = lecturerData.courses.find(c => String(c.id) === courseId);
+    const assessment = course?.assessments.find(a => a.id === assessmentId);
+    if (!course || !assessment) { setShowMarksModal(false); return; }
 
-  /** Inline save all */
-  const handleSaveAllMarks = () => pushToast('All marks saved', 'success');
+    for (const [studentId, markVal] of Object.entries(marksModalValues)) {
+      const clamped = markVal === null ? null : Math.max(0, Math.min(assessment.maxMarks, Math.round(markVal)));
+      setLocalMark(courseId, studentId, assessmentId, clamped);
+      // eslint-disable-next-line no-await-in-loop
+      await commitMarkToServer(courseId, studentId, assessmentId, clamped);
+    }
+    setShowMarksModal(false);
+  };
 
   /** CSV download helpers */
   const downloadCSV = (filename: string, csvContent: string) => {
@@ -758,19 +839,6 @@ const handleSendAnnouncement = async () => {
     downloadCSV(`${course.code}_Assessment_Summary.csv`, [headers.join(','), ...rows].join('\n'));
     pushToast('Assessment Summary downloaded', 'success');
   };
-
-  /** Announcement attachments handler */
-  const handleAnnouncementFiles = (files: FileList | null) => {
-    if (!files) return;
-    const newFiles: ResourceFile[] = Array.from(files).map(f => ({
-  id: String(Date.now() + Math.floor(Math.random() * 1000)), // ✅ now a string
-  name: f.name,
-  url: URL.createObjectURL(f)
-}));
-
-    setAnnouncementAttachments(prev => [...prev, ...newFiles]);
-  };
-  const removeAnnouncementAttachment = (id: string) => setAnnouncementAttachments(prev => prev.filter(a => a.id !== id));
 
   /** Sidebar sticky classes: we will style sidebar to remain sticky below the header (header height is h-16 -> 64px). */
   const handleLogout = () => { localStorage.removeItem('user'); navigate('/'); };
@@ -974,6 +1042,8 @@ const eligibleStudents = uniqueEligibleStudents.length;
       return s.name.toLowerCase().includes(q) || s.studentNumber.toLowerCase().includes(q);
     });
 
+    const dirtyCountForCourse = Object.keys(dirtyMarks).filter(k => k.startsWith(`${course.id}:`)).length;
+
     return (
       <div className="space-y-6">
         <div className="flex justify-between items-center">
@@ -998,7 +1068,13 @@ else setMarksFilterAssessmentId(v); // ✅ keep as string
               {course.assessments.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
             </select>
 
-            <button onClick={handleSaveAllMarks} className="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors">Save All Marks</button>
+            <button
+              onClick={() => handleSaveAllMarks(course.id)}
+              className="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors disabled:opacity-50"
+              disabled={dirtyCountForCourse === 0}
+            >
+              {dirtyCountForCourse > 0 ? `Save All Marks (${dirtyCountForCourse} unsaved)` : 'Save All Marks'}
+            </button>
           </div>
         </div>
 
@@ -1021,24 +1097,40 @@ else setMarksFilterAssessmentId(v); // ✅ keep as string
                     <td className="px-6 py-4 whitespace-nowrap"><div className="text-sm font-medium text-gray-900">{student.name}</div></td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{student.studentNumber}</td>
 
-                    {assessmentsToShow.map(assessment => (
-                      <td key={assessment.id} className="px-6 py-4 whitespace-nowrap">
-                        <input
-                          type="number" min={0} max={assessment.maxMarks}
-                          value={student.assessments[assessment.id] ?? ''}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            const num = val === '' ? null : Number(val);
-                            updateStudentMark(course.id, student.id, assessment.id, num);
-                          }}
-                          className="w-20 px-2 py-1 text-sm border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-blue-500"
-                          placeholder="—"
-                        />
-                      </td>
-                    ))}
+                    {assessmentsToShow.map(assessment => {
+                      const cellKey = `${course.id}:${student.id}:${assessment.id}`;
+                      const isDirty = !!dirtyMarks[cellKey];
+                      const isSaving = !!savingMarks[cellKey];
+                      return (
+                        <td key={assessment.id} className="px-6 py-4 whitespace-nowrap">
+                          <input
+                            type="number" min={0} max={assessment.maxMarks}
+                            value={student.assessments[assessment.id] ?? ''}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              const num = val === '' ? null : Number(val);
+                              // Update local state only — the DB write happens on blur, not on
+                              // every keystroke.
+                              setLocalMark(course.id, student.id, assessment.id, num);
+                            }}
+                            onBlur={(e) => {
+                              const val = e.target.value;
+                              const num = val === '' ? null : Number(val);
+                              commitMarkToServer(course.id, student.id, assessment.id, num);
+                            }}
+                            disabled={isSaving}
+                            className={`w-20 px-2 py-1 text-sm border rounded focus:outline-none focus:ring-1 focus:ring-blue-500 ${
+                              isDirty ? 'border-amber-400 bg-amber-50' : 'border-gray-300'
+                            }`}
+                            placeholder="—"
+                            title={isDirty ? 'Unsaved change — will save when you click away' : undefined}
+                          />
+                        </td>
+                      );
+                    })}
 
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <span className={`text-sm font-medium ${student.courseworkTotal >= 50 ? 'text-green-600' : 'text-red-600'}`}>{student.courseworkTotal}%</span>
+                      <span className={`text-sm font-medium ${student.courseworkTotal >= examEligibilityThreshold ? 'text-green-600' : 'text-red-600'}`}>{student.courseworkTotal}%</span>
                     </td>
 
                     <td className="px-6 py-4 whitespace-nowrap">
@@ -1101,9 +1193,9 @@ else setMarksFilterAssessmentId(v); // ✅ keep as string
                 {course.students.map(student => (
                   <tr key={student.id} className="hover:bg-gray-50">
                     <td className="px-6 py-4 whitespace-nowrap"><div className="text-sm font-medium text-gray-900">{student.name}</div><div className="text-sm text-gray-500">{student.studentNumber}</div></td>
-                    <td className="px-6 py-4 whitespace-nowrap"><span className={`text-sm font-medium ${student.courseworkTotal >= 75 ? 'text-green-600' : student.courseworkTotal >= 50 ? 'text-blue-600' : 'text-red-600'}`}>{student.courseworkTotal}%</span></td>
+                    <td className="px-6 py-4 whitespace-nowrap"><span className={`text-sm font-medium ${student.courseworkTotal >= 75 ? 'text-green-600' : student.courseworkTotal >= examEligibilityThreshold ? 'text-blue-600' : 'text-red-600'}`}>{student.courseworkTotal}%</span></td>
                     <td className="px-6 py-4 whitespace-nowrap">{student.examEligible ? <span className="px-2 py-1 text-xs font-medium bg-green-100 text-green-800 rounded-full">Exam Eligible</span> : <span className="px-2 py-1 text-xs font-medium bg-red-100 text-red-800 rounded-full">Not Eligible</span>}</td>
-                    <td className="px-6 py-4 whitespace-nowrap"><div className="w-full bg-gray-200 rounded-full h-2"><div className={`h-2 rounded-full ${student.courseworkTotal >= 75 ? 'bg-green-500' : student.courseworkTotal >= 50 ? 'bg-blue-500' : 'bg-red-500'}`} style={{ width: `${Math.min(student.courseworkTotal, 100)}%` }}></div></div></td>
+                    <td className="px-6 py-4 whitespace-nowrap"><div className="w-full bg-gray-200 rounded-full h-2"><div className={`h-2 rounded-full ${student.courseworkTotal >= 75 ? 'bg-green-500' : student.courseworkTotal >= examEligibilityThreshold ? 'bg-blue-500' : 'bg-red-500'}`} style={{ width: `${Math.min(student.courseworkTotal, 100)}%` }}></div></div></td>
                   </tr>
                 ))}
               </tbody>
@@ -1249,8 +1341,8 @@ else setMarksFilterAssessmentId(v); // ✅ keep as string
                   <div className="mt-2 space-y-1 text-sm">
                     {announcementAttachments.map(f => (
                       <div key={f.id} className="flex items-center justify-between bg-gray-50 p-2 rounded">
-                        <a href={f.url} download={f.name} className="underline">{f.name}</a>
-                        <button onClick={() => removeAnnouncementAttachment(f.id)} className="text-red-600 text-sm">Remove</button>
+                        <a href={f.url} download={f.name} target="_blank" rel="noreferrer" className="underline">{f.name}</a>
+                        <button type="button" onClick={() => removeAnnouncementAttachment(f.id)} className="text-red-600 text-sm">Remove</button>
                       </div>
                     ))}
                   </div>
