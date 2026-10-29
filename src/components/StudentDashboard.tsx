@@ -1,5 +1,5 @@
 // src/components/StudentDashboard.tsx
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { useNavigate } from 'react-router-dom';
 import UserProfileModal from './UserProfileModal';
@@ -62,7 +62,7 @@ interface CalendarEvent {
   title: string;
   date: string;
   time: string;
-  type: string; // will now be the event type name (e.g., "Exam Week", "Lecture")
+  type: string; // will now be the event type name (e.g., "exam", "lecture") — always lowercase
   venue?: string;
   course?: string;
   description?: string;
@@ -80,6 +80,39 @@ interface Announcement {
   priority: 'high' | 'medium' | 'low';
   read: boolean;
 }
+
+/** Only count assessments that have actually been graded; an ungraded assessment is not the
+ *  same thing as a 0% and must never drag an average down. */
+const isGraded = (a: any) => a && a.percentage !== null && a.percentage !== undefined;
+
+/** Average of an assessment list's percentages, counting only graded ones. */
+const averagePercentage = (assessments: any[]): number => {
+  const graded = (assessments || []).filter(isGraded);
+  if (graded.length === 0) return 0;
+  const total = graded.reduce((sum, a) => sum + Number(a.percentage), 0);
+  return Math.round(total / graded.length);
+};
+
+/** Coursework (non-exam) average for a course's assessment list — this is the real,
+ *  DB-backed substitute for the previously-invented "year mark" (which was just final x 0.4). */
+const computeCourseworkAverage = (courseAssessments: any[]): number | null => {
+  const coursework = (courseAssessments || []).filter(
+    a => !String(a.type ?? '').toLowerCase().includes('exam')
+  );
+  const graded = coursework.filter(isGraded);
+  if (graded.length === 0) return null;
+  const total = graded.reduce((sum, a) => sum + Number(a.percentage), 0);
+  return Math.round(total / graded.length);
+};
+
+/** Programs store duration as free text (e.g. "3 years"); pull the first number out of it
+ *  instead of letting it get string-concatenated onto the current year. */
+const parseDurationYears = (duration: any): number => {
+  if (duration === null || duration === undefined || duration === '') return 3;
+  if (typeof duration === 'number' && !Number.isNaN(duration)) return duration;
+  const match = String(duration).match(/\d+/);
+  return match ? Number(match[0]) : 3;
+};
 
 const StudentDashboard: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
@@ -102,6 +135,7 @@ const StudentDashboard: React.FC = () => {
   /* -------------------------
      Supabase-backed student data
      ------------------------- */
+  const [studentId, setStudentId] = useState<string | null>(null); // the students.id PK, needed for writes (goals, announcement reads)
   const [courses, setCourses] = useState<Array<any>>([]); // UI shape expected by renderers
   const [courseSchedules, setCourseSchedules] = useState<any[]>([]);
   const [academicRecord, setAcademicRecord] = useState<any | null>(null);
@@ -128,11 +162,8 @@ const StudentDashboard: React.FC = () => {
       const parsedUser = JSON.parse(userData);
       if (parsedUser.role === 'student') {
         setUser(parsedUser);
-        // local fallback goals
-        const savedGoals = localStorage.getItem(`studyGoals_${parsedUser.userNumber}`);
-        if (savedGoals) {
-          try { setStudyGoals(JSON.parse(savedGoals)); } catch { /* ignore */ }
-        }
+        // Study goals are persisted in the `study_goals` table (see loadStudentData) — no
+        // localStorage fallback is used anymore.
       } else {
         navigate('/login');
       }
@@ -163,6 +194,8 @@ const StudentDashboard: React.FC = () => {
       setAnnouncementsFromDB([]);
       return;
     }
+
+    if (mounted) setStudentId(studentRow.id);
 
     // --- 2. Fetch enrollments (enriched nested course) ---
     const { data: enrolls, error: enrollErr } = await supabase
@@ -212,58 +245,6 @@ const StudentDashboard: React.FC = () => {
       coursesById = Object.fromEntries((courseRows || []).map((c: any) => [c.id, c]));
     }
 
-    // --- Step: Fetch courses for student's current year (NEW) ---
-    // This fetch brings in courses for the student's program and current academic year.
-    // We then merge them into coursesById so downstream logic can leverage richer metadata.
-    try {
-      if (studentRow.program_id) {
-        const { data: yearCourses, error: yearCourseErr } = await supabase
-          .from('courses')
-          .select(`
-            id,
-            name,
-            code,
-            credits,
-            semester,
-            academic_year,
-            program:program_id ( id, name ),
-            lecturer:lecturer_id ( id, profile_id )
-          `)
-          .eq('program_id', studentRow.program_id)
-          .eq('academic_year', String(studentRow.year_of_study))
-          .eq('status', 'active');
-
-        if (yearCourseErr) {
-          // throw or log depending on desired behaviour; log and continue to avoid breaking the whole load
-          console.warn('⚠️ Failed to fetch year-specific courses:', yearCourseErr);
-        } else {
-          (yearCourses || []).forEach((yc: any) => {
-            // normalize the returned row to match coursesById shape used later
-            const normalized = {
-              id: yc.id,
-              name: yc.name,
-              code: yc.code,
-              credits: yc.credits,
-              semester: yc.semester,
-              academic_year: yc.academic_year,
-              // prefer nested program id if present, otherwise fallback to program_id field
-              program_id: (yc.program && yc.program.id) || yc.program_id || studentRow.program_id,
-              // lecturer could be nested object or scalar id
-              lecturer_id: (yc.lecturer && yc.lecturer.id) || yc.lecturer_id || null,
-              // keep year_level if available elsewhere; fall back to academic_year where appropriate
-              year_level: yc.year_level ?? (yc.academic_year ? Number(yc.academic_year) : undefined),
-            };
-            coursesById[String(normalized.id)] = {
-              ...(coursesById[String(normalized.id)] || {}),
-              ...normalized,
-            };
-          });
-        }
-      }
-    } catch (yrErr) {
-      console.warn('⚠️ Year courses fetch failed unexpectedly:', yrErr);
-    }
-
     // --- FETCH student assessments WITH marks FOR LOGGED-IN STUDENT ---
     let assessmentsByCourse: Record<string, any[]> = {};
     if (courseIds.length) {
@@ -295,10 +276,17 @@ const StudentDashboard: React.FC = () => {
           const cid = String(a.course_id ?? '');
           const studentMark = (a.student_assessment_marks || []).find(
             (m: any) => m.student_id === studentRow.id
-          ) || {};
+          );
 
-          const score = Number(studentMark.marks_obtained ?? 0);
           const max = Number(a.maximum_marks ?? 100) || 100;
+          // Distinguish "ungraded" from "scored zero": only treat the assessment as graded
+          // when a mark actually exists.
+          const hasMark = studentMark?.marks_obtained !== undefined && studentMark?.marks_obtained !== null;
+          const score = hasMark ? Number(studentMark.marks_obtained) : null;
+          const percentage = hasMark
+            ? (studentMark?.percentage ?? (max > 0 ? Math.round(((score as number) / max) * 100) : 0))
+            : null;
+
           const normalized = {
             id: a.id,
             course_id: a.course_id,
@@ -307,12 +295,11 @@ const StudentDashboard: React.FC = () => {
             weight: a.weight_percentage ?? 0,
             score,
             maxScore: max,
-            percentage:
-              studentMark.percentage ?? (max > 0 ? Math.round((score / max) * 100) : 0),
+            percentage,
             due_date: a.due_date,
-            submitted_date: studentMark.submitted_date,
-            graded_date: studentMark.graded_date,
-            status: studentMark.status,
+            submitted_date: studentMark?.submitted_date,
+            graded_date: studentMark?.graded_date,
+            status: studentMark?.status,
           };
 
           if (!assessmentsByCourse[cid]) assessmentsByCourse[cid] = [];
@@ -416,6 +403,15 @@ const StudentDashboard: React.FC = () => {
       const cFromTable = coursesById[courseId] || {};
       const lecturer_id = nested.lecturer_id ?? cFromTable.lecturer_id ?? null;
 
+      // "Course Progress" is how much of the course's assessments have actually been graded —
+      // it must never be the student's final grade (final_percentage), which is a result, not
+      // a measure of how much of the course has been completed.
+      const courseAssessments = assessmentsByCourse[String(courseId)] || [];
+      const gradedCount = courseAssessments.filter(isGraded).length;
+      const completionPercentage = courseAssessments.length > 0
+        ? Math.round((gradedCount / courseAssessments.length) * 100)
+        : 0;
+
       return {
         id: courseId,
         name: nested.name ?? cFromTable.name ?? undefined,
@@ -426,8 +422,8 @@ const StudentDashboard: React.FC = () => {
         lecturer_id,
         lecturer: '',
         eligibleForExam: Boolean(en.is_exam_eligible) === true,
-        completionPercentage: Number(en.final_percentage ?? 0),
-        assessments: assessmentsByCourse[String(courseId)] || [],
+        completionPercentage,
+        assessments: courseAssessments,
         nextClass: { date: '', time: '', venue: '', topic: '' },
         upcomingAssessments: [] as any[],
         program: nested.program ?? cFromTable.program_id ?? null,
@@ -478,23 +474,33 @@ const StudentDashboard: React.FC = () => {
       eventTypeMap[et.id] = { name: et.name, color: et.color_code || '#6b7280' };
     });
 
-    // Fetch upcoming events
-    const { data: eventsRows, error: eventsErr } = await supabase
+    // Fetch upcoming events — scoped to this student: either tied to one of their enrolled
+    // courses, or institution-wide (no course_id at all). Previously every event for every
+    // course was shown to every student regardless of enrollment.
+    let eventsQuery = supabase
       .from('events')
       .select('id, title, event_date, start_time, end_time, venue, course_id, description, event_type_id')
       .gte('event_date', todayISO)
       .order('event_date', { ascending: true });
 
+    eventsQuery = courseIds.length
+      ? eventsQuery.or(`course_id.in.(${courseIds.join(',')}),course_id.is.null`)
+      : eventsQuery.is('course_id', null);
+
+    const { data: eventsRows, error: eventsErr } = await eventsQuery;
+
     if (eventsErr) throw eventsErr;
 
     upcoming = (eventsRows || []).map((ev: any) => {
-      const typeInfo = eventTypeMap[ev.event_type_id] || { name: 'Event', color: '#6b7280' };
+      const typeInfo = eventTypeMap[ev.event_type_id] || { name: 'event', color: '#6b7280' };
       return {
         id: ev.id,
         title: ev.title,
         date: ev.event_date,
         time: ev.start_time ?? ev.end_time ?? '',
-        type: typeInfo.name,
+        // event_types.name is stored lowercase in the DB ('exam', 'assignment', ...) — keep it
+        // as-is so it matches the (lowercase) calendar filter values.
+        type: String(typeInfo.name || 'event').toLowerCase(),
         color: typeInfo.color,
         venue: ev.venue,
         course: ev.course_id ? String(ev.course_id) : undefined,
@@ -502,33 +508,68 @@ const StudentDashboard: React.FC = () => {
       } as CalendarEvent;
     });
 
-    // Announcements
+    // Announcements — resolve the real sender name instead of showing a raw UUID, and load
+    // which of these this student has already read from `announcement_reads` instead of
+    // always starting every announcement as unread.
     let ann: Announcement[] = [];
     if (courseIds.length) {
-      const { data: annRows } = await supabase
+      const { data: annRows, error: annErr } = await supabase
         .from('announcements')
         .select('id, title, content, published_at, course_id, created_by')
         .in('course_id', courseIds)
         .order('published_at', { ascending: false })
         .limit(50);
-      ann = (annRows || []).map((a: any) => ({
+
+      if (annErr) console.error('Failed to fetch announcements', annErr);
+
+      const annList = annRows || [];
+
+      const creatorIds = Array.from(new Set(annList.map((a: any) => a.created_by).filter(Boolean)));
+      let nameByUserId: Record<string, string> = {};
+      if (creatorIds.length) {
+        const { data: creatorProfiles, error: creatorErr } = await supabase
+          .from('profiles')
+          .select('user_id, full_name, first_name, last_name')
+          .in('user_id', creatorIds);
+        if (creatorErr) {
+          console.error('Failed to resolve announcement senders', creatorErr);
+        } else {
+          (creatorProfiles || []).forEach((p: any) => {
+            nameByUserId[p.user_id] = p.full_name || `${p.first_name ?? ''} ${p.last_name ?? ''}`.trim();
+          });
+        }
+      }
+
+      const annIds = annList.map((a: any) => a.id);
+      let readIds = new Set<string | number>();
+      if (annIds.length) {
+        const { data: readRows, error: readErr } = await supabase
+          .from('announcement_reads')
+          .select('announcement_id')
+          .eq('student_id', studentRow.id)
+          .in('announcement_id', annIds);
+        if (readErr) console.error('Failed to fetch announcement read status', readErr);
+        else readIds = new Set((readRows || []).map((r: any) => r.announcement_id));
+      }
+
+      ann = annList.map((a: any) => ({
         id: a.id,
         title: a.title,
         message: a.content,
-        sender: String(a.created_by),
+        sender: nameByUserId[a.created_by] || 'Course Lecturer',
         date: a.published_at,
         course: a.course_id ? String(a.course_id) : undefined,
         priority: 'medium',
-        read: false,
+        read: readIds.has(a.id),
       }));
     }
 
-    // Study goals
+    // Study goals — persisted in `study_goals`, not localStorage.
     let dbGoals: StudyGoal[] = [];
     try {
       const { data: goalRows } = await supabase
         .from('study_goals')
-        .select('id, title, description, target_date, completion_percentage, status, course_id')
+        .select('id, title, description, target_date, completion_percentage, status, course_id, priority')
         .eq('student_id', studentRow.id);
       dbGoals = (goalRows || []).map((g: any) => ({
         id: g.id,
@@ -536,18 +577,16 @@ const StudentDashboard: React.FC = () => {
         description: g.description,
         targetDate: g.target_date ?? '',
         completed: g.status === 'completed' || (g.completion_percentage ?? 0) >= 100,
-        priority: 'medium' as const,
+        priority: (g.priority as StudyGoal['priority']) ?? 'medium',
         course: g.course_id ? String(g.course_id) : '',
       }));
     } catch { /* ignore */ }
 
-    // --- FETCH course schedules and prepare map for nextClass calculation ---
-    const daysOfWeekOrder = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
-    const todayIndex = now.getDay(); // 0 = Sunday, 1 = Monday, etc.
-
-    let courseSchedulesByCourse: Record<string, any[]> = {};
+    // --- FETCH course schedules so the Timetable can render real data instead of a fake
+    //     `courses[(col + row) % n]` fill pattern ---
+    let scheduleRows: any[] = [];
     if (courseIds.length) {
-      const { data: scheduleRows, error: scheduleErr } = await supabase
+      const { data: schedData, error: scheduleErr } = await supabase
         .from('course_schedules')
         .select('id, course_id, day_of_week, start_time, end_time, venue, is_active')
         .in('course_id', courseIds)
@@ -556,16 +595,22 @@ const StudentDashboard: React.FC = () => {
       if (scheduleErr) {
         console.error('❌ Failed to fetch course schedules:', scheduleErr.message || scheduleErr);
       } else {
-        scheduleRows?.forEach((s: any) => {
-          const cid = String(s.course_id);
-          if (!courseSchedulesByCourse[cid]) courseSchedulesByCourse[cid] = [];
-          courseSchedulesByCourse[cid].push(s);
-        });
+        scheduleRows = schedData || [];
       }
     }
+
+    const daysOfWeekOrder = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+    const todayIndex = now.getDay(); // 0 = Sunday, 1 = Monday, etc.
+
+    let courseSchedulesByCourse: Record<string, any[]> = {};
+    scheduleRows.forEach((s: any) => {
+      const cid = String(s.course_id);
+      if (!courseSchedulesByCourse[cid]) courseSchedulesByCourse[cid] = [];
+      courseSchedulesByCourse[cid].push(s);
+    });
     console.log('✅ courseSchedulesByCourse', courseSchedulesByCourse);
 
-    // --- 9. Build mappedCourses (UI shape) including the new nextClass logic ---
+    // --- 9. Build mappedCourses (UI shape) including the next-class lookup ---
     const mappedCourses = courseRows.map((c: any) => {
       const key = String(c.id);
       const schedules = courseSchedulesByCourse[key] || [];
@@ -656,16 +701,34 @@ const StudentDashboard: React.FC = () => {
       records: [],
     };
 
-    const completedEnrolls = (displayEnrollments || []).filter((e) => e.final_percentage !== null && e.final_percentage !== undefined);
-    academicSummary.completedCredits = completedEnrolls.reduce((sum: number, e: any) => {
-      const credits = Number((e.courses?.credits ?? coursesById[e.course_id]?.credits) ?? 0);
-      return sum + credits;
-    }, 0);
+    // Credits for a given enrollment row, used both for "completed credits" and for the
+    // credit-weighted GPA below.
+    const creditsForEnrollment = (e: any) =>
+      Number((e.courses?.credits ?? coursesById[e.course_id]?.credits) ?? 0);
 
-    academicSummary.currentGPA = (
-      completedEnrolls.reduce((sum: number, e: any) => sum + (Number(e.grade_points) || 0), 0) /
-      (completedEnrolls.length || 1)
-    ).toFixed(2);
+    const completedEnrolls = (displayEnrollments || []).filter(
+      (e) => e.final_percentage !== null && e.final_percentage !== undefined
+    );
+    academicSummary.completedCredits = completedEnrolls.reduce(
+      (sum: number, e: any) => sum + creditsForEnrollment(e),
+      0
+    );
+
+    // GPA must be credit-weighted (sum(grade_points * credits) / sum(credits)), not a flat
+    // average of grade points across courses — a 1-credit course and a 20-credit course do
+    // not count equally toward GPA.
+    const gpaEligibleEnrolls = completedEnrolls.filter(
+      (e: any) => e.grade_points !== null && e.grade_points !== undefined
+    );
+    const totalGradePointCredits = gpaEligibleEnrolls.reduce(
+      (sum: number, e: any) => sum + Number(e.grade_points) * creditsForEnrollment(e),
+      0
+    );
+    const totalGpaCredits = gpaEligibleEnrolls.reduce(
+      (sum: number, e: any) => sum + creditsForEnrollment(e),
+      0
+    );
+    academicSummary.currentGPA = (totalGpaCredits > 0 ? totalGradePointCredits / totalGpaCredits : 0).toFixed(2);
 
     const grouped: Record<string, any> = {};
     (displayEnrollments || []).forEach((en) => {
@@ -678,7 +741,9 @@ const StudentDashboard: React.FC = () => {
         id: c.id ?? en.course_id,
         name: c.name,
         code: c.code,
-        yearMark: en.final_percentage ? Math.round(Number(en.final_percentage) * 0.4) : '-',
+        // Real coursework (continuous-assessment) average, replacing the previous invented
+        // "year mark" that was simply `final_percentage * 0.4` with no actual basis.
+        courseworkAverage: computeCourseworkAverage(assessmentsByCourse[String(en.course_id)] || []),
         finalMark: en.final_percentage ?? '-',
         result: Number(en.final_percentage) >= 50 ? 'PASS' : 'FAIL',
         credits: Number(c.credits ?? 0),
@@ -701,7 +766,9 @@ const StudentDashboard: React.FC = () => {
       if (prog) {
         academicSummary.program = prog.name ?? prog ?? null;
         academicSummary.totalCredits = prog.total_credits ?? academicSummary.totalCredits;
-        academicSummary.expectedGraduation = `${new Date().getFullYear() + (prog.duration || 3)}`;
+        // `duration` is free text like "3 years" — parse the number out of it rather than
+        // adding the whole string to the current year (which previously produced "20263 years").
+        academicSummary.expectedGraduation = `${new Date().getFullYear() + parseDurationYears(prog.duration)}`;
         if (prog.department_id) {
           const { data: dept } = await supabase
             .from('departments')
@@ -723,10 +790,11 @@ const StudentDashboard: React.FC = () => {
     // --- 12. Update UI state ---
     if (mounted) {
       setCourses(mappedCourses);
+      setCourseSchedules(scheduleRows);
       setAcademicRecord(academicSummary);
       setUpcomingEvents(upcoming);
       setAnnouncementsFromDB(ann);
-      if (dbGoals.length) setStudyGoals(dbGoals);
+      setStudyGoals(dbGoals);
     }
   } catch (err) {
     console.error('Failed to load student data', err);
@@ -749,32 +817,61 @@ const StudentDashboard: React.FC = () => {
     navigate('/');
   };
 
-  const handleCreateGoal = () => {
-  try {
-    const goal: StudyGoal = {
-      id: Date.now(),
-      ...newGoal,
-      completed: false
-    };
-    const updatedGoals = [...studyGoals, goal];
-    setStudyGoals(updatedGoals);
-    localStorage.setItem(`studyGoals_${user?.userNumber}`, JSON.stringify(updatedGoals));
+  /** Persist a study goal to `study_goals` instead of localStorage. */
+  const handleCreateGoal = async () => {
+    if (!studentId) {
+      setNotification({ type: 'error', message: 'Could not find your student record ❌' });
+      return;
+    }
+    if (!newGoal.title.trim()) {
+      setNotification({ type: 'error', message: 'Please give the goal a title' });
+      return;
+    }
 
-    setShowGoalModal(false);
-    setNewGoal({
-      title: '',
-      description: '',
-      targetDate: '',
-      priority: 'medium',
-      course: ''
-    });
+    try {
+      const { data, error } = await supabase
+        .from('study_goals')
+        .insert([{
+          student_id: studentId,
+          title: newGoal.title.trim(),
+          description: newGoal.description,
+          target_date: newGoal.targetDate || null,
+          course_id: newGoal.course || null,
+          priority: newGoal.priority,
+          status: 'in_progress',
+          completion_percentage: 0,
+        }])
+        .select()
+        .single();
 
-    setNotification({ type: 'success', message: 'Study goal added successfully ✅' });
-  } catch (err) {
-    console.error('Failed to add goal', err);
-    setNotification({ type: 'error', message: 'Something went wrong while adding the goal ❌' });
-  }
-};
+      if (error) throw error;
+
+      const goal: StudyGoal = {
+        id: data.id,
+        title: data.title,
+        description: data.description,
+        targetDate: data.target_date ?? '',
+        completed: false,
+        priority: (data.priority as StudyGoal['priority']) ?? newGoal.priority,
+        course: data.course_id ? String(data.course_id) : ''
+      };
+
+      setStudyGoals(prev => [...prev, goal]);
+      setShowGoalModal(false);
+      setNewGoal({
+        title: '',
+        description: '',
+        targetDate: '',
+        priority: 'medium',
+        course: ''
+      });
+
+      setNotification({ type: 'success', message: 'Study goal added successfully ✅' });
+    } catch (err) {
+      console.error('Failed to add goal', err);
+      setNotification({ type: 'error', message: 'Something went wrong while adding the goal ❌' });
+    }
+  };
 
 useEffect(() => {
   if (notification) {
@@ -784,40 +881,70 @@ useEffect(() => {
 }, [notification]);
 
 
-  const toggleGoalComplete = (goalId: number | string) => {
-  try {
-    const updatedGoals = studyGoals.map(goal =>
-      goal.id === goalId ? { ...goal, completed: !goal.completed } : goal
-    );
-    setStudyGoals(updatedGoals);
-    localStorage.setItem(`studyGoals_${user?.userNumber}`, JSON.stringify(updatedGoals));
+  const toggleGoalComplete = async (goalId: number | string) => {
+    const current = studyGoals.find(g => g.id === goalId);
+    if (!current) return;
+    const nextCompleted = !current.completed;
 
-    const toggledGoal = updatedGoals.find(g => g.id === goalId);
-    if (toggledGoal?.completed) {
-      setNotification({ type: 'success', message: 'Goal marked as completed 🎉' });
-    } else {
-      setNotification({ type: 'success', message: 'Goal marked as incomplete ↩️' });
+    // optimistic local update
+    setStudyGoals(prev => prev.map(goal => (goal.id === goalId ? { ...goal, completed: nextCompleted } : goal)));
+
+    try {
+      const { error } = await supabase
+        .from('study_goals')
+        .update({
+          status: nextCompleted ? 'completed' : 'in_progress',
+          completion_percentage: nextCompleted ? 100 : 0,
+        })
+        .eq('id', goalId);
+      if (error) throw error;
+
+      setNotification({
+        type: 'success',
+        message: nextCompleted ? 'Goal marked as completed 🎉' : 'Goal marked as incomplete ↩️'
+      });
+    } catch (err) {
+      console.error('Failed to toggle goal', err);
+      // revert optimistic update on failure
+      setStudyGoals(prev => prev.map(goal => (goal.id === goalId ? { ...goal, completed: !nextCompleted } : goal)));
+      setNotification({ type: 'error', message: 'Something went wrong updating the goal ❌' });
     }
-  } catch (err) {
-    console.error('Failed to toggle goal', err);
-    setNotification({ type: 'error', message: 'Something went wrong updating the goal ❌' });
-  }
-};
+  };
 
-const deleteGoal = (goalId: number | string) => {
+const deleteGoal = async (goalId: number | string) => {
+  const previous = studyGoals;
+  setStudyGoals(prev => prev.filter(goal => goal.id !== goalId));
+
   try {
-    const updatedGoals = studyGoals.filter(goal => goal.id !== goalId);
-    setStudyGoals(updatedGoals);
-    localStorage.setItem(`studyGoals_${user?.userNumber}`, JSON.stringify(updatedGoals));
-
+    const { error } = await supabase.from('study_goals').delete().eq('id', goalId);
+    if (error) throw error;
     setNotification({ type: 'success', message: 'Goal deleted 🗑️' });
   } catch (err) {
     console.error('Failed to delete goal', err);
+    setStudyGoals(previous);
     setNotification({ type: 'error', message: 'Something went wrong deleting the goal ❌' });
   }
 };
   const toggleYearExpansion = (yearSemester: string) => {
     setExpandedYears(prev => ({ ...prev, [yearSemester]: !prev[yearSemester] }));
+  };
+
+  /** Mark one announcement as read for this student — persisted via `announcement_reads`
+   *  instead of being reset to unread on every reload. */
+  const markAnnouncementRead = async (announcementId: number | string) => {
+    if (!studentId) return;
+    setAnnouncementsFromDB(prev => prev.map(a => (a.id === announcementId ? { ...a, read: true } : a)));
+    try {
+      const { error } = await supabase
+        .from('announcement_reads')
+        .upsert(
+          { student_id: studentId, announcement_id: announcementId, read_at: new Date().toISOString() },
+          { onConflict: 'student_id,announcement_id' }
+        );
+      if (error) throw error;
+    } catch (err) {
+      console.error('Failed to persist announcement read status', err);
+    }
   };
 
   if (!user) return null;
@@ -834,19 +961,8 @@ const deleteGoal = (goalId: number | string) => {
     (courseFilter === 'all' || c.id?.toString() === courseFilter)
   );
 
-  // calculate average for a course using student_assessment_marks percentage
-const calculateStudentAverage = (assessments: any[]) => {
-  if (!assessments || assessments.length === 0) return 0;
-
-  const validPercentages = assessments
-    .map(a => Number(a.percentage ?? a.student_assessment_marks?.[0]?.percentage ?? 0))
-    .filter(p => !isNaN(p));
-
-  if (validPercentages.length === 0) return 0;
-
-  const total = validPercentages.reduce((sum, p) => sum + p, 0);
-  return Math.round(total / validPercentages.length);
-};
+  // average for a course, counting only graded assessments (ungraded ones no longer count as 0)
+  const calculateStudentAverage = (assessments: any[]) => averagePercentage(assessments);
 
 // usage in overall stats
 const getOverallStats = () => {
@@ -870,15 +986,9 @@ const getOverallStats = () => {
   );
 
   const totalAssessmentsCount = filteredAssessments.length;
-  const avgScoreForFiltered = filteredAssessments.length
-  ? Math.round(
-      filteredAssessments.reduce((sum, a) => {
-        const score = Number(a.score ?? a.marks_obtained ?? a.marks ?? 0);
-        const max = Number(a.maxScore ?? a.maximum_marks ?? a.max ?? 100) || 100;
-        return sum + (max === 0 ? 0 : (score / max) * 100);
-      }, 0) / filteredAssessments.length
-    )
-  : 0;
+  // Only graded assessments contribute to the average — an assessment nobody has marked yet
+  // is not a 0%.
+  const avgScoreForFiltered = averagePercentage(filteredAssessments);
 
   const eligibleCountForFiltered = filteredCourses.filter(c => c.eligibleForExam).length;
   const filteredCoursesCount = filteredCourses.length;
@@ -1015,7 +1125,7 @@ const getOverallStats = () => {
         const assessRows = (c.assessments || []).map((a: any) => `
           <tr>
             <td>${a.type}</td>
-            <td>${a.score ?? 0}/${a.maxMarks ?? '-'}</td>
+            <td>${a.score ?? '—'}/${a.maxScore ?? '-'}</td>
             <td>${a.weight ?? 0}%</td>
           </tr>
         `).join('');
@@ -1108,18 +1218,21 @@ const getOverallStats = () => {
 
         const pdf = new jsPDF({ unit: 'pt', format: 'a4', orientation: 'portrait' });
         const pdfWidth = pdf.internal.pageSize.getWidth();
+        const pageHeight = pdf.internal.pageSize.getHeight();
         const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
 
-        // If content longer than one page, add pages
-        let heightLeft = pdfHeight;
+        // Draw the full image on page 1, then keep adding pages — shifting the image up by one
+        // page height each time — only while content genuinely remains below the fold. The
+        // previous `heightLeft > -1` condition always added one extra, unwanted page.
+        let heightLeft = pdfHeight - pageHeight;
         let position = 0;
         pdf.addImage(imgData, 'JPEG', 0, position, pdfWidth, pdfHeight);
-        heightLeft -= pdf.internal.pageSize.getHeight();
-        while (heightLeft > -1) {
+
+        while (heightLeft > 0) {
           position = heightLeft - pdfHeight;
           pdf.addPage();
           pdf.addImage(imgData, 'JPEG', 0, position, pdfWidth, pdfHeight);
-          heightLeft -= pdf.internal.pageSize.getHeight();
+          heightLeft -= pageHeight;
         }
 
         const blob = pdf.output('blob');
@@ -1437,6 +1550,7 @@ const getOverallStats = () => {
                     onClick={() => {
                       setSelectedAnnouncement(announcement);
                       setShowAnnouncementModal(true);
+                      markAnnouncementRead(announcement.id);
                     }}
                   >
                     <div className="flex items-start justify-between">
@@ -1561,11 +1675,11 @@ const getOverallStats = () => {
                     <div key={index} className="flex justify-between items-center p-3 bg-gray-50 rounded-lg">
                       <div>
                         <span className="text-sm text-gray-600">{assessment.type}</span>
-                        <div className="text-xs text-gray-500">{assessment.date}</div>
+                        <div className="text-xs text-gray-500">{assessment.due_date}</div>
                       </div>
                       <div className="text-right">
                         <span className="font-medium text-gray-900">
-                          {assessment.score ?? 0}/{assessment.maxScore ?? 0}
+                          {assessment.score != null ? assessment.score : '—'}/{assessment.maxScore ?? 0}
                         </span>
                         <div className="text-xs text-gray-500">{assessment.weight}% weight</div>
                       </div>
@@ -1603,7 +1717,7 @@ const getOverallStats = () => {
                     {(course.upcomingAssessments || []).map((assessment: any, index: number) => (
                       <div key={index} className="p-3 bg-orange-50 rounded-lg">
                         <div className="text-sm font-medium text-orange-900">{assessment.type}</div>
-                        <div className="text-xs text-orange-700">{assessment.date}</div>
+                        <div className="text-xs text-orange-700">{assessment.due_date}</div>
                         <div className="text-xs text-orange-600">{assessment.venue ?? ''} • {assessment.weight ?? ''}% weight</div>
                       </div>
                     ))}
@@ -1695,44 +1809,52 @@ const getOverallStats = () => {
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Assessment</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Score</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Weight</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Due Date</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Performance</th>
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
-              {filteredAssessments.map((assessment, idx) => (
-                <tr key={`${assessment.courseId}-${idx}`} className="hover:bg-gray-50">
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="text-sm font-medium text-gray-900">{assessment.courseCode}</div>
-                    <div className="text-sm text-gray-500">{assessment.courseName}</div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{assessment.type}</td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <span className={`text-sm font-medium ${
-                      ((assessment.score ?? 0) / (assessment.maxScore || 1)) * 100 >= 50 ? 'text-green-600' : 'text-red-600'
-                    }`}>
-                      {assessment.score ?? 0}/{assessment.maxScore ?? 0}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{assessment.weight}%</td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{assessment.date}</td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="w-full bg-gray-200 rounded-full h-2">
-                      <div
-                        className={`h-2 rounded-full ${
-                          ((assessment.score ?? 0) / (assessment.maxScore || 1)) * 100 >= 75 ? 'bg-green-500' :
-                          ((assessment.score ?? 0) / (assessment.maxScore || 1)) * 100 >= 50 ? 'bg-yellow-500' :
-                          'bg-red-500'
-                        }`}
-                        style={{ width: `${((assessment.score ?? 0) / (assessment.maxScore || 1)) * 100}%` }}
-                      />
-                    </div>
-                    <div className="text-xs text-gray-500 mt-1">
-                      {Math.round(((assessment.score ?? 0) / (assessment.maxScore || 1)) * 100)}%
-                    </div>
-                  </td>
-                </tr>
-              ))}
+              {filteredAssessments.map((assessment, idx) => {
+                const graded = isGraded(assessment);
+                const pct = graded ? Number(assessment.percentage) : 0;
+                return (
+                  <tr key={`${assessment.courseId}-${idx}`} className="hover:bg-gray-50">
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="text-sm font-medium text-gray-900">{assessment.courseCode}</div>
+                      <div className="text-sm text-gray-500">{assessment.courseName}</div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{assessment.type}</td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className={`text-sm font-medium ${
+                        !graded ? 'text-gray-400' : pct >= 50 ? 'text-green-600' : 'text-red-600'
+                      }`}>
+                        {assessment.score != null ? assessment.score : '—'}/{assessment.maxScore ?? 0}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{assessment.weight}%</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{assessment.due_date}</td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      {graded ? (
+                        <>
+                          <div className="w-full bg-gray-200 rounded-full h-2">
+                            <div
+                              className={`h-2 rounded-full ${
+                                pct >= 75 ? 'bg-green-500' :
+                                pct >= 50 ? 'bg-yellow-500' :
+                                'bg-red-500'
+                              }`}
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                          <div className="text-xs text-gray-500 mt-1">{pct}%</div>
+                        </>
+                      ) : (
+                        <div className="text-xs text-gray-400">Not graded yet</div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -1923,12 +2045,14 @@ const renderCalendar = () => {
             className="px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
             <option value="all">All Events</option>
-            {/* If you load event types dynamically, this can be replaced by a .map over your event_types */}
-            <option value="Exam">Exams</option>
-            <option value="Assignment">Assignments</option>
-            <option value="Lecture">Lectures</option>
-            <option value="Registration">Registration</option>
-            <option value="Holiday">Holidays</option>
+            {/* event_types.name is stored lowercase in the DB ('exam', 'assignment', ...), and
+                events are tagged with that exact lowercase value — these option values must
+                match it, or the filter silently matches nothing. */}
+            <option value="exam">Exams</option>
+            <option value="assignment">Assignments</option>
+            <option value="lecture">Lectures</option>
+            <option value="registration">Registration</option>
+            <option value="holiday">Holidays</option>
           </select>
         </div>
       </div>
@@ -2079,9 +2203,26 @@ const renderCalendar = () => {
 
 
 
-// --- Timetable (uses `courses` state for schedule placeholders) ---
+// --- Timetable: renders the student's REAL weekly schedule from `course_schedules`,
+// instead of the previous fake `courses[(col + row) % n]` fill pattern. ---
 const renderTimetable = () => {
-  // NOTE: depends on whether you store timetable/schedule in DB. For now use `courses` state to render nextClass or placeholders.
+  const dayColumns: Array<{ key: string; label: string }> = [
+    { key: 'monday', label: 'Monday' },
+    { key: 'tuesday', label: 'Tuesday' },
+    { key: 'wednesday', label: 'Wednesday' },
+    { key: 'thursday', label: 'Thursday' },
+    { key: 'friday', label: 'Friday' },
+  ];
+
+  const timeSlots = ['08:00', '09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00'];
+
+  const toMinutes = (t: string) => {
+    const [h, m] = String(t || '00:00').slice(0, 5).split(':').map(Number);
+    return (h || 0) * 60 + (m || 0);
+  };
+
+  const courseById: Record<string, any> = Object.fromEntries(courses.map(c => [String(c.id), c]));
+
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
@@ -2099,39 +2240,60 @@ const renderTimetable = () => {
             <thead className="bg-gray-50">
               <tr>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Monday</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Tuesday</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Wednesday</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Thursday</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Friday</th>
+                {dayColumns.map(day => (
+                  <th key={day.key} className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">{day.label}</th>
+                ))}
               </tr>
             </thead>
 
             <tbody className="bg-white divide-y divide-gray-200">
-              {['08:00-09:00','09:00-10:00','10:00-11:00','11:00-12:00','12:00-13:00','13:00-14:00','14:00-15:00','15:00-16:00'].map((time, index) => (
-                <tr key={index} className="hover:bg-gray-50">
-                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{time}</td>
+              {timeSlots.map((slot) => {
+                const slotStart = toMinutes(slot);
+                const slotEnd = slotStart + 60;
+                const [h] = slot.split(':').map(Number);
+                const nextLabel = `${String((h + 1) % 24).padStart(2, '0')}:00`;
 
-                  {/* For each weekday cell, try to show a matching nextClass from courses if available, otherwise keep placeholder */}
-                  {['mon','tue','wed','thu','fri'].map((day, colIndex) => {
-                    // simple heuristic: map some sample courses into cells using index; replace this logic with your course schedule mapping
-                    const courseForCell = courses?.[ (colIndex + index) % (courses?.length || 1) ] ?? null;
-                    return (
-                      <td key={day} className="px-6 py-4 whitespace-nowrap">
-                        {courseForCell ? (
-                          <div className="p-2 bg-blue-50 rounded border-l-4 border-blue-500">
-                            <div className="text-sm font-medium text-blue-900">{courseForCell.code ?? courseForCell.name}</div>
-                            <div className="text-xs text-blue-700">{courseForCell.nextClass?.venue ?? courseForCell.venue ?? 'TBA'}</div>
-                          </div>
-                        ) : null}
-                      </td>
-                    );
-                  })}
-                </tr>
-              ))}
+                return (
+                  <tr key={slot} className="hover:bg-gray-50">
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{slot}-{nextLabel}</td>
+
+                    {dayColumns.map(day => {
+                      // Real schedule entries that overlap this hour slot, on this real weekday.
+                      const entries = (courseSchedules || []).filter((cs: any) => {
+                        if (String(cs.day_of_week ?? '').toLowerCase() !== day.key) return false;
+                        const csStart = toMinutes(cs.start_time);
+                        const csEnd = toMinutes(cs.end_time);
+                        return csStart < slotEnd && csEnd > slotStart;
+                      });
+
+                      return (
+                        <td key={day.key} className="px-6 py-4 align-top">
+                          {entries.map((e: any) => {
+                            const course = courseById[String(e.course_id)];
+                            return (
+                              <div key={e.id} className="p-2 mb-1 bg-blue-50 rounded border-l-4 border-blue-500">
+                                <div className="text-sm font-medium text-blue-900">
+                                  {course?.code ?? 'Course'}
+                                </div>
+                                <div className="text-xs text-blue-700">
+                                  {String(e.start_time).slice(0, 5)}–{String(e.end_time).slice(0, 5)}
+                                </div>
+                                <div className="text-xs text-blue-700">{e.venue ?? 'TBA'}</div>
+                              </div>
+                            );
+                          })}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
+        {courseSchedules.length === 0 && (
+          <div className="p-6 text-sm text-gray-500 text-center">No scheduled classes found for your enrolled courses.</div>
+        )}
       </div>
     </div>
   );
@@ -2165,7 +2327,7 @@ const totalCreditsRequired = totalCreditsFromProgram ?? (sumCreditsFromRecords |
 const completedCreditsFromAcad = acad?.completedCredits ?? acad?.completed_credits ?? null;
 const completedCreditsFallback = records.reduce((rsum: number, r: any) => {
   return rsum + ((r.courses || []).reduce((csum: number, c: any) => {
-    const finalMark = Number(c.finalMark ?? c.yearMark ?? 0);
+    const finalMark = Number(c.finalMark ?? 0);
     return csum + ((finalMark >= 50) ? (Number(c.credits) || 0) : 0);
   }, 0));
 }, 0);
@@ -2203,10 +2365,13 @@ const getAssessmentsForCourse = (course: any) => {
 
 /** Normaliser: for an assessment entry, return consistent fields ({ id, name/type, score, max, weight, percentage, marks_field }) */
 const normalizeAssessment = (a: any) => {
-  const score = Number(a.score ?? a.marks_obtained ?? a.marks ?? 0);
+  const hasScore = a.score !== null && a.score !== undefined;
+  const score = hasScore ? Number(a.score) : null;
   const max = Number(a.maxScore ?? a.maximum_marks ?? a.maxMarks ?? 100) || 100;
   const weight = a.weight ?? a.weight_percentage ?? a.weightPercentage ?? 0;
-  const percentage = a.percentage ?? (max > 0 ? Math.round((score / max) * 100) : 0);
+  const percentage = a.percentage !== null && a.percentage !== undefined
+    ? Number(a.percentage)
+    : (hasScore && max > 0 ? Math.round(((score as number) / max) * 100) : null);
   return {
     id: a.id ?? a.assessment_id ?? null,
     name: a.type ?? a.name ?? 'Assessment',
@@ -2334,7 +2499,7 @@ const normalizeAssessment = (a: any) => {
                         </div>
                         <div className="text-right">
                           <div className="flex items-center space-x-4 text-sm">
-                            <span className="text-gray-600">Year Mark: <span className="font-semibold text-gray-900">{course.yearMark ?? '-'}</span></span>
+                            <span className="text-gray-600">Coursework Average: <span className="font-semibold text-gray-900">{course.courseworkAverage ?? '-'}</span></span>
                             <span className="text-gray-600">Final Mark: <span className="font-semibold text-gray-900">{course.finalMark ?? '-'}</span></span>
                             <span className={`px-2 py-1 text-xs font-medium rounded-full ${String(course.result).toUpperCase() === 'PASS' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>Result: {course.result ?? '-'}</span>
                           </div>
@@ -2354,15 +2519,16 @@ const normalizeAssessment = (a: any) => {
 
       return assessments.map((ass: any, ai: number) => {
         const n = normalizeAssessment(ass);
-        const barClass = n.percentage >= 70 ? 'bg-green-500' : n.percentage >= 50 ? 'bg-blue-500' : 'bg-red-500';
+        const pct = n.percentage ?? 0;
+        const barClass = pct >= 70 ? 'bg-green-500' : pct >= 50 ? 'bg-blue-500' : 'bg-red-500';
         return (
           <div key={ai} className="bg-white p-3 rounded border">
             <div className="text-xs font-medium text-gray-600 mb-1">{n.name}</div>
-            <div className="text-lg font-semibold text-gray-900">{n.score}/{n.max}</div>
-            <div className="text-xs text-gray-500">Weight: {n.weight}% • {n.percentage}%</div>
+            <div className="text-lg font-semibold text-gray-900">{n.score ?? '—'}/{n.max}</div>
+            <div className="text-xs text-gray-500">Weight: {n.weight}% • {n.percentage != null ? `${n.percentage}%` : 'Not graded'}</div>
             <div className="mt-2">
               <div className="w-full bg-gray-200 rounded-full h-1.5">
-                <div className={`h-1.5 rounded-full ${barClass}`} style={{ width: `${n.percentage}%` }} />
+                <div className={`h-1.5 rounded-full ${barClass}`} style={{ width: `${pct}%` }} />
               </div>
             </div>
             {/* optionally show submission/graded info if available */}
@@ -2447,10 +2613,27 @@ const renderCommunication = () => {
 
   const unreadCount = announcements.filter((ann: Announcement) => !ann.read).length;
 
-  const handleMarkAllRead = () => {
-    // mark locally; if you want to persist to supabase, add an API call here
-    const updated = announcements.map((a: Announcement) => ({ ...a, read: true }));
-    setAnnouncementsFromDB(updated);
+  const handleMarkAllRead = async () => {
+    const unread = announcements.filter((a: Announcement) => !a.read);
+    if (unread.length === 0) return;
+
+    // optimistic local update
+    setAnnouncementsFromDB(prev => prev.map((a: Announcement) => ({ ...a, read: true })));
+
+    if (!studentId) return;
+    try {
+      const rows = unread.map(a => ({
+        student_id: studentId,
+        announcement_id: a.id,
+        read_at: new Date().toISOString()
+      }));
+      const { error } = await supabase
+        .from('announcement_reads')
+        .upsert(rows, { onConflict: 'student_id,announcement_id' });
+      if (error) throw error;
+    } catch (err) {
+      console.error('Failed to persist mark-all-read', err);
+    }
   };
 
   return (
@@ -2486,6 +2669,7 @@ const renderCommunication = () => {
               onClick={() => {
                 setSelectedAnnouncement(announcement);
                 setShowAnnouncementModal(true);
+                markAnnouncementRead(announcement.id);
               }}
             >
               <div className="flex items-start justify-between">
@@ -2703,7 +2887,9 @@ const renderCommunication = () => {
                   >
                     <option value="">Select Course</option>
                     {courses.map(course => (
-                      <option key={course.id} value={course.code}>{course.code} - {course.name}</option>
+                      // Use the course id (a real FK target for study_goals.course_id), not its
+                      // display code, now that goals are actually persisted to the database.
+                      <option key={course.id} value={course.id}>{course.code} - {course.name}</option>
                     ))}
                   </select>
                 </div>
