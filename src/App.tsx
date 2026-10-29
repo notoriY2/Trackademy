@@ -20,7 +20,7 @@ import StudentDashboard from './components/StudentDashboard';
 import LecturerDashboard from './components/LecturerDashboard';
 import AdminDashboard from './components/AdminDashboard';
 import Settings from './components/admin/Settings';
-import { ToastProvider } from './components/ToastProvider';
+import { ToastProvider } from './components/ui/Feedback';
 
 function LandingPage() {
   const navigate = useNavigate();
