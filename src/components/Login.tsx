@@ -1,8 +1,31 @@
-// src/components/Login.tsx
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { GraduationCap, User, Lock, AlertCircle } from 'lucide-react';
 import { supabase } from '../lib/supabase';
+
+type SupportedRole = 'student' | 'lecturer' | 'admin';
+
+const getDashboardPath = (role: unknown): string | null => {
+  switch (role) {
+    case 'student':
+      return '/student-dashboard';
+    case 'lecturer':
+      return '/lecturer-dashboard';
+    case 'admin':
+      return '/admin-dashboard';
+    default:
+      return null;
+  }
+};
+
+const getStoredUser = (): any | null => {
+  try {
+    const user = JSON.parse(localStorage.getItem('user') || 'null');
+    return user && typeof user === 'object' ? user : null;
+  } catch {
+    return null;
+  }
+};
 
 const Login: React.FC = () => {
   const [userNumber, setUserNumber] = useState('');
@@ -11,34 +34,45 @@ const Login: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const navigate = useNavigate();
 
+  useEffect(() => {
+    const user = getStoredUser();
+    const dashboardPath = getDashboardPath(user?.role);
+
+    if (dashboardPath) {
+      navigate(dashboardPath, { replace: true });
+    }
+  }, [navigate]);
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
     setError('');
 
     try {
-      // Call the Postgres RPC which validates password server-side using crypt()
       const { data, error: rpcError } = await supabase
         .rpc('auth_local_signin', { p_user_number: userNumber, p_password: password });
 
       if (rpcError) {
         console.error('RPC error:', rpcError);
         setError('Login failed — server error.');
-        setIsLoading(false);
         return;
       }
 
-      // rpc returns an array of rows; take first
       const row = Array.isArray(data) ? data[0] : data;
       if (!row) {
         setError('Invalid credentials. Please check your user number and password.');
-        setIsLoading(false);
         return;
       }
 
       const { user_id, profile_id, role, full_name } = row as any;
+      const dashboardPath = getDashboardPath(role);
 
-      // Save minimal session info to localStorage (you can expand later)
+      if (!dashboardPath || !(['student', 'lecturer', 'admin'] as SupportedRole[]).includes(role)) {
+        setError('Your account role is not supported.');
+        localStorage.removeItem('user');
+        return;
+      }
+
       localStorage.setItem('user', JSON.stringify({
         userId: user_id,
         profileId: profile_id,
@@ -47,12 +81,7 @@ const Login: React.FC = () => {
         name: full_name ?? userNumber
       }));
 
-      // Navigate to role dashboard
-      if (role === 'student') navigate('/student-dashboard');
-      else if (role === 'lecturer') navigate('/lecturer-dashboard');
-      else if (role === 'admin') navigate('/admin-dashboard');
-      else navigate('/home');
-
+      navigate(dashboardPath, { replace: true });
     } catch (err) {
       console.error(err);
       setError('Unexpected error during login.');
@@ -139,7 +168,7 @@ const Login: React.FC = () => {
 
         <div className="text-center">
           <button
-            onClick={() => navigate('/home')}
+            onClick={() => navigate('/')}
             className="text-blue-600 hover:text-blue-500 text-sm font-medium"
           >
             ← Back to Home

@@ -1,5 +1,5 @@
 import React from 'react';
-import { BrowserRouter as Router, Routes, Route, useNavigate } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, useNavigate, Navigate } from 'react-router-dom';
 import { 
   GraduationCap, 
   Users, 
@@ -19,8 +19,8 @@ import Login from './components/Login';
 import StudentDashboard from './components/StudentDashboard';
 import LecturerDashboard from './components/LecturerDashboard';
 import AdminDashboard from './components/AdminDashboard';
-import LoadingScreen from './components/LoadingScreen';
 import Settings from './components/admin/Settings';
+import { ToastProvider } from './components/ToastProvider';
 
 function LandingPage() {
   const navigate = useNavigate();
@@ -66,7 +66,7 @@ function LandingPage() {
             </h1>
             <p className="text-xl text-gray-600 mb-8 max-w-3xl mx-auto">
               A comprehensive student academic performance and course management system designed for tertiary institutions. 
-              Track assessments, manage attendance, and automate exam eligibility with ease.
+              Track assessments, capture marks, and automate exam eligibility.
             </p>
             <div className="flex flex-col sm:flex-row gap-4 justify-center">
               <button 
@@ -126,8 +126,8 @@ function LandingPage() {
               <div className="bg-orange-100 w-12 h-12 rounded-lg flex items-center justify-center mb-6 group-hover:bg-orange-200 transition-colors">
                 <Calendar className="h-6 w-6 text-orange-600" />
               </div>
-              <h3 className="text-xl font-semibold text-gray-900 mb-3">Attendance Management</h3>
-              <p className="text-gray-600">Comprehensive attendance tracking per course and lecture with detailed reporting capabilities.</p>
+              <h3 className="text-xl font-semibold text-gray-900 mb-3">Study Goals &amp; Calendar</h3>
+              <p className="text-gray-600">Set personal study goals and organize academic tasks and important dates in one place.</p>
             </div>
 
             <div className="bg-white p-8 rounded-xl border border-gray-200 hover:shadow-lg transition-shadow group">
@@ -143,7 +143,7 @@ function LandingPage() {
                 <Shield className="h-6 w-6 text-indigo-600" />
               </div>
               <h3 className="text-xl font-semibold text-gray-900 mb-3">Role-Based Access Control</h3>
-              <p className="text-gray-600">Secure access management with distinct permissions for administrators, lecturers, students, and exam officers.</p>
+              <p className="text-gray-600">Secure access management with distinct permissions for administrators, lecturers, and students.</p>
             </div>
           </div>
         </div>
@@ -161,7 +161,7 @@ function LandingPage() {
             </p>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
             <div className="bg-white p-8 rounded-xl shadow-sm border border-gray-100">
               <div className="bg-blue-600 w-16 h-16 rounded-xl flex items-center justify-center mb-6">
                 <Shield className="h-8 w-8 text-white" />
@@ -184,7 +184,7 @@ function LandingPage() {
               <p className="text-gray-600 mb-4">Course management and academic performance tracking capabilities.</p>
               <ul className="space-y-2 text-sm text-gray-500">
                 <li>• Upload marks</li>
-                <li>• Track attendance</li>
+                <li>• View class lists</li>
                 <li>• Manage assessments</li>
                 <li>• Course materials</li>
               </ul>
@@ -198,25 +198,12 @@ function LandingPage() {
               <p className="text-gray-600 mb-4">Access to personal academic information and progress tracking.</p>
               <ul className="space-y-2 text-sm text-gray-500">
                 <li>• View results</li>
-                <li>• Check attendance</li>
+                <li>• Track study goals</li>
                 <li>• Eligibility status</li>
                 <li>• Course schedules</li>
               </ul>
             </div>
 
-            <div className="bg-white p-8 rounded-xl shadow-sm border border-gray-100">
-              <div className="bg-orange-600 w-16 h-16 rounded-xl flex items-center justify-center mb-6">
-                <FileText className="h-8 w-8 text-white" />
-              </div>
-              <h3 className="text-xl font-semibold text-gray-900 mb-3">Exam Officer</h3>
-              <p className="text-gray-600 mb-4">Specialized tools for examination process management.</p>
-              <ul className="space-y-2 text-sm text-gray-500">
-                <li>• Verify eligibility</li>
-                <li>• Exam schedules</li>
-                <li>• Process oversight</li>
-                <li>• Compliance checks</li>
-              </ul>
-            </div>
           </div>
         </div>
       </section>
@@ -340,18 +327,103 @@ function LandingPage() {
   );
 }
 
+const getUser = () => {
+  try {
+    return JSON.parse(localStorage.getItem('user') || 'null');
+  } catch {
+    return null;
+  }
+};
+
+const getDashboardPath = (role: string) => {
+  switch (role) {
+    case 'student':
+      return '/student-dashboard';
+    case 'lecturer':
+      return '/lecturer-dashboard';
+    case 'admin':
+      return '/admin-dashboard';
+    default:
+      return null;
+  }
+};
+
+const Protected: React.FC<{ role: string; children: React.ReactElement }> = ({
+  role,
+  children,
+}) => {
+  const user = getUser();
+
+  if (!user || user.role !== role) {
+    return <Navigate to="/login" replace />;
+  }
+
+  return children;
+};
+
+const NotFound: React.FC = () => {
+  const navigate = useNavigate();
+
+  return (
+    <div className="min-h-screen grid place-items-center bg-gray-50 px-6 text-center">
+      <div>
+        <p className="text-6xl font-bold text-blue-600">404</p>
+        <h1 className="mt-3 text-2xl font-semibold text-gray-900">Page not found</h1>
+        <p className="mt-2 text-gray-600">That page doesn't exist or has moved.</p>
+        <button
+          onClick={() => navigate('/')}
+          className="mt-6 rounded-xl bg-blue-600 px-5 py-3 font-medium text-white"
+        >
+          Go home
+        </button>
+      </div>
+    </div>
+  );
+};
+
 function App() {
   return (
     <Router>
-      <Routes>
-        <Route path="/" element={<LoadingScreen />} />
-        <Route path="/home" element={<LandingPage />} />
-        <Route path="/login" element={<Login />} />
-        <Route path="/student-dashboard" element={<StudentDashboard />} />
-        <Route path="/lecturer-dashboard" element={<LecturerDashboard />} />
-        <Route path="/admin-dashboard" element={<AdminDashboard />} />
-        <Route path="/admin/settings" element={<Settings />} />
-      </Routes>
+      <ToastProvider>
+        <Routes>
+          <Route path="/" element={<LandingPage />} />
+          <Route path="/home" element={<Navigate to="/" replace />} />
+          <Route path="/login" element={<Login />} />
+          <Route
+            path="/student-dashboard"
+            element={
+              <Protected role="student">
+                <StudentDashboard />
+              </Protected>
+            }
+          />
+          <Route
+            path="/lecturer-dashboard"
+            element={
+              <Protected role="lecturer">
+                <LecturerDashboard />
+              </Protected>
+            }
+          />
+          <Route
+            path="/admin-dashboard"
+            element={
+              <Protected role="admin">
+                <AdminDashboard />
+              </Protected>
+            }
+          />
+          <Route
+            path="/admin/settings"
+            element={
+              <Protected role="admin">
+                <Settings />
+              </Protected>
+            }
+          />
+          <Route path="*" element={<NotFound />} />
+        </Routes>
+      </ToastProvider>
     </Router>
   );
 }

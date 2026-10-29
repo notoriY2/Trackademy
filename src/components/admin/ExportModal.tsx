@@ -26,7 +26,6 @@ type ExportId =
   | 'students'
   | 'courses'
   | 'grades'
-  | 'attendance'
   | 'lecturers'
   | 'schedule'
   | 'departments'
@@ -45,7 +44,6 @@ const EXPORT_OPTIONS: ExportOption[] = [
   { id: 'students', name: 'Student Records', description: 'Student information and profiles', formats: ['xlsx', 'csv', 'pdf'], category: 'academic' },
   { id: 'courses', name: 'Course Data', description: 'Course details, credits, enrollment numbers', formats: ['xlsx', 'csv', 'pdf'], category: 'academic' },
   { id: 'grades', name: 'Grade Reports', description: 'Enrollments, final grades and percentages', formats: ['xlsx', 'csv', 'pdf'], category: 'academic' },
-  { id: 'attendance', name: 'Attendance Records', description: 'Attendance (if available)', formats: ['xlsx', 'csv'], category: 'academic' },
   { id: 'lecturers', name: 'Lecturer Information', description: 'Lecturers and their profile info', formats: ['xlsx', 'csv', 'pdf'], category: 'administrative' },
   { id: 'schedule', name: 'Academic Schedule', description: 'Course schedules and venues', formats: ['xlsx', 'csv', 'pdf'], category: 'administrative' },
   { id: 'departments', name: 'Department Data', description: 'Departments, codes and meta', formats: ['xlsx', 'csv', 'pdf'], category: 'administrative' },
@@ -257,7 +255,6 @@ const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose }) => {
       students: 2.5,
       courses: 1.2,
       grades: 3.8,
-      attendance: 1.8,
       lecturers: 0.8,
       schedule: 0.5,
       departments: 0.3,
@@ -341,7 +338,6 @@ const ExportModal: React.FC<ExportModalProps> = ({ isOpen, onClose }) => {
                       case 'students': return Users;
                       case 'courses': return BookOpen;
                       case 'grades': return BarChart3;
-                      case 'attendance': return Calendar;
                       case 'lecturers': return Users;
                       case 'schedule': return Calendar;
                       case 'departments': return Database;
